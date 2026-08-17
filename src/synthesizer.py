@@ -161,7 +161,7 @@ class CodebaseSynthesizer:
         # Tambahkan recursion_limit untuk mencegah infinite loop!
         config = {
             "configurable": {"thread_id": thread_id},
-            "recursion_limit": 10  # Maksimal 10 kali putaran (Thought -> Action)
+            "recursion_limit": 20  # Maksimal 10 kali putaran (Thought -> Action)
         }
 
         # LangGraph Stream Event Loop (Pass config ke dalam stream)
