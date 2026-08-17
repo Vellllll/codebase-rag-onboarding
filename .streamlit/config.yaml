@@ -7,7 +7,7 @@ credentials:
     guest:
       email: guest@example.com
       name: Guest User
-      password: $2b$12$v5AX65xGSjE0b2xVGKagU.1LtUajq5NF46vviwcTXbHIcXzjV1kU
+      password: $2b$12$8VAo.AsTbvuaenAtz1oEqeXC3xphEn8xjQG3/xZ.PCa0tuDeQaEmq
 cookie:
   expiry_days: 30
   key: b9f87171b40fd608b25976e0377155732a3fc1f6ba9f3d4fa9a288021d414317
