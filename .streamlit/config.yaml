@@ -1,0 +1,14 @@
+credentials:
+  usernames:
+    arvel:
+      email: arvel@example.com
+      name: Arvel Adelar
+      password: $2b$12$/LiwpsviCxtdXNddMXlyX.faYw20K1vqY5dnhSwr2xkD3OZ/G97cW
+    guest:
+      email: guest@example.com
+      name: Guest User
+      password: $2b$12$V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.
+cookie:
+  expiry_days: 30
+  key: kunci_rahasia_cookie_acak
+  name: codebase_rag_cookie

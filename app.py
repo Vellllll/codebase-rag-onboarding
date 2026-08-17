@@ -1,9 +1,16 @@
 import streamlit as st
 import os
-from streamlit_mermaid import st_mermaid
 import re
+import yaml
+from yaml.loader import SafeLoader
+from streamlit_mermaid import st_mermaid
+from dotenv import load_dotenv
+import streamlit_authenticator as stauth
 
-# Import Synthesizer & Indexer dari backend yang sudah kita buat
+# Load environment variables
+load_dotenv()
+
+# Import Synthesizer & Indexer dari backend
 from src.synthesizer import CodebaseSynthesizer
 from src.indexer import IncrementalCodebaseIndexer
 
@@ -14,22 +21,51 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- SISTEM LOGIN (STREAMLIT AUTHENTICATOR) ---
+# Membaca data akun dari config.yaml
+with open('.streamlit/config.yaml') as file:
+    config = yaml.load(file, Loader=SafeLoader)
+
+# Inisialisasi Authenticator
+# Inisialisasi Authenticator (TANPA config['preauthorized'])
+authenticator = stauth.Authenticate(
+    config['credentials'],
+    config['cookie']['name'],
+    config['cookie']['key'],
+    config['cookie']['expiry_days']
+)
+
+# Render widget login (Pembaruan v3.x menggunakan keyword 'location')
+authenticator.login(location="main")
+
+# Pengecekan status menggunakan st.session_state
+if st.session_state["authentication_status"] is False:
+    st.error("❌ Username atau password salah!")
+    st.stop() # Hentikan aplikasi jika gagal login
+elif st.session_state["authentication_status"] is None:
+    st.warning("🔒 Silakan masukkan username dan password Anda.")
+    st.stop() # Hentikan aplikasi jika belum login
+
+# =====================================================================
+# --- KODE APLIKASI UTAMA (HANYA BERJALAN JIKA LOGIN BERHASIL) ---
+# =====================================================================
+
+# Tampilkan tombol Logout di Sidebar
+with st.sidebar:
+    st.write(f"Selamat datang, **{st.session_state['name']}**! 👋")
+    authenticator.logout(location="sidebar")
+    st.markdown("---")
+
 # --- CACHING BACKEND ENGINE ---
 @st.cache_resource
 def load_synthesizer():
-    """Memuat engine Synthesizer RAG ke memori (caching agar cepat)."""
     return CodebaseSynthesizer()
 
 @st.cache_resource
-def load_indexer():
-    """Memuat Indexer untuk kebutuhan re-indexing repositori."""
+def load_indexer() -> IncrementalCodebaseIndexer:
     return IncrementalCodebaseIndexer()
 
-# --- INITIALIZATION ---
-st.title("🤖 AI Codebase Onboarding & Architecture Assistant")
-st.caption("Tanyakan arsitektur, alur data, atau lokasi fungsi pada codebase repositori kamu.")
-
-# Inisialisasi Session State untuk menyimpan history chat
+# --- INITIALIZATION & SESSION STATE ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -37,35 +73,40 @@ if "messages" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Repository Settings")
     
-    # Ganti dari local path ke URL Input
     github_url_input = st.text_input(
-        "Public GitHub Repository URL:", 
-        placeholder="https://github.com/facebook/react"
+        "GitHub Repository URL:", 
+        placeholder="https://github.com/username/repo-name"
     )
     
-    if st.button("⚡ Index Public Repository", type="primary"):
+    github_token_input = st.text_input(
+        "GitHub Access Token (PAT):",
+        type="password",
+        help="Wajib diisi jika ingin meng-index Private Repository."
+    )
+    
+    if st.button("⚡ Index Repository", type="primary"):
         if github_url_input.startswith("https://github.com/"):
             with st.spinner("Cloning repository, parsing AST, & indexing chunks..."):
                 try:
-                    indexer = load_indexer()
-                    total_chunks = indexer.index_from_github_url(github_url_input)
+                    indexer = IncrementalCodebaseIndexer()
+                    total_chunks = indexer.index_from_github_url(
+                        github_url=github_url_input,
+                        github_token=github_token_input if github_token_input else None
+                    )
                     
                     if total_chunks > 0:
-                        st.success(f"Berhasil meng-index {total_chunks} chunk kode dari GitHub!")
-                        st.cache_resource.clear() # Reset cache
+                        st.success(f"Berhasil meng-index {total_chunks} chunk kode!")
+                        st.cache_resource.clear()
                     else:
-                        st.warning("Tidak ditemukan file kode (TS/JS/Py) yang valid.")
+                        st.warning("Tidak ditemukan file kode yang valid.")
                 except Exception as e:
-                    st.error(f"Gagal memproses repositori GitHub: {e}")
+                    st.error(f"Gagal memproses repositori: {e}")
         else:
-            st.error("Masukkan URL GitHub yang valid (contoh: https://github.com/user/repo)!")
+            st.error("Masukkan URL GitHub yang valid!")
 
-    st.markdown("---")
-    st.markdown("**Features Supported:**")
-    st.markdown("- 🌳 AST Code Chunking")
-    st.markdown("- 🔍 Hybrid Search (Vector + BM25)")
-    st.markdown("- 📊 Automatic Mermaid.js Diagrams")
-    st.markdown("- 📍 Precise File & Line Referencing")
+# --- MAIN APP INTERFACE (CHAT DLL) ---
+st.title("🤖 AI Codebase Onboarding & Architecture Assistant")
+# (Lanjutkan dengan kode chat interface, st_mermaid, dan synthesizer seperti sebelumnya...)
 
 # --- HELPER FUNCTION: PARSE MERMAID BLOCK ---
 def extract_mermaid_code(text: str):

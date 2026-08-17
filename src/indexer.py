@@ -122,21 +122,32 @@ class IncrementalCodebaseIndexer:
         print("✅ Indeksasi Qdrant Selesai!")
         return qdrant
     
-    def index_from_github_url(self, github_url: str):
-        """Meng-clone repo publik ke temporary directory, mem-parse AST, lalu menghapus temp folder."""
-        # Create temporary directory
+    def index_from_github_url(self, github_url: str, github_token: str = None) -> int:
+        """
+        Meng-clone repo (public maupun private) ke temporary directory, 
+        mem-parse AST, lalu menghapus temp folder.
+        """
         temp_dir = tempfile.mkdtemp()
         print(f"📥 Cloned repo temporarily to: {temp_dir}")
+        
+        # 1. Format URL untuk mensupport Private Repository menggunakan PAT
+        clone_url = github_url.strip()
+        if github_token and github_token.strip():
+            token = github_token.strip()
+            # Mengubah 'https://github.com/username/private-repo'
+            # Menjadi 'https://<TOKEN>@github.com/username/private-repo'
+            if clone_url.startswith("https://"):
+                clone_url = clone_url.replace("https://", f"https://{token}@")
 
         try:
-            # 1. Clone repository dari GitHub
-            Repo.clone_from(github_url, temp_dir, depth=1) # depth=1 agar clone sangat cepat (shallow clone)
+            # 2. Clone repository (shallow clone depth=1 agar sangat cepat)
+            Repo.clone_from(clone_url, temp_dir, depth=1)
             
-            # 2. Parse AST & Extract Chunks
+            # 3. Parse AST & Extract Chunks
             docs = self.walk_and_parse(temp_dir)
             
             if docs:
-                # 3. Index ke Qdrant Vector Store
+                # 4. Index ke Qdrant Vector Store
                 self.index_to_qdrant(docs, force_recreate=True)
                 print(f"✅ Berhasil meng-index repositori dari URL: {github_url}")
                 return len(docs)
@@ -144,7 +155,10 @@ class IncrementalCodebaseIndexer:
                 print("⚠️ Tidak ada file kode yang valid untuk di-index.")
                 return 0
 
+        except GitCommandError as e:
+            print(f"❌ Error Git Cloning (Cek URL/PAT atau izin repositori): {e}")
+            raise Exception("Gagal meng-clone repositori. Pastikan URL dan GitHub Access Token valid serta memiliki izin akses ke repo ini.")
         finally:
-            # 4. Hapus folder temporary agar tidak memakan penyimpanan lokal
+            # 5. Hapus folder temporary agar tidak memakan penyimpanan lokal
             shutil.rmtree(temp_dir)
             print("🧹 Temporary folder berhasil dibersihkan.")
