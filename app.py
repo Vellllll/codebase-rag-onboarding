@@ -1,4 +1,5 @@
 import streamlit as st
+import uuid
 import os
 import re
 import json
@@ -146,6 +147,9 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "indexing_in_progress" not in st.session_state:
     st.session_state.indexing_in_progress = False
+# BIKIN THREAD ID UNTUK MEMORY LANGGRAPH
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
 
 index_meta = load_index_metadata()
 has_index = index_meta is not None
@@ -273,6 +277,7 @@ with st.sidebar:
     st.divider()
     if st.button("🗑️ Hapus Riwayat Chat", use_container_width=True, disabled=not st.session_state.messages):
         st.session_state.messages = []
+        st.session_state.thread_id = str(uuid.uuid4()) # RESET INGATAN AGENT
         st.rerun()
 
     st.caption("✨ **Fitur Aktif:** Hybrid Search, RRF, Cross-Encoder, Mermaid Diagrams, Folder Filtering.")
@@ -364,9 +369,14 @@ if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
         
         import time
         try:
-            # Membaca kejadian (event) dari Agent
-            for event in synthesizer.stream_answer_events(prompt, target_folders=target_folders_list):
-                
+            # Membaca kejadian (event) dari Agent (DENGAN MEMORI)
+            stream_generator = synthesizer.stream_answer_events(
+                prompt, 
+                target_folders=target_folders_list,
+                thread_id=st.session_state.thread_id  # <--- PARAMETER BARU
+            )
+            
+            for event in stream_generator:
                 if event["type"] == "tool_start":
                     tool_name = event["tool"]
                     # Gunakan status.update(label=...) BUKAN status.write(...)

@@ -7,6 +7,7 @@ from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver  # <-- IMPORT BARU
 
 from src.retriever import HybridCodeRetriever
 
@@ -70,11 +71,14 @@ class CodebaseSynthesizer:
 
         self.tools = [search_codebase, self.web_search]
         
-        # 2. Inisialisasi Agent LangGraph
+        # 2. Inisialisasi Memory dan Agent LangGraph
+        self.memory = MemorySaver()  # <-- INISIALISASI MEMORY
+        
         self.agent_executor = create_react_agent(
             model=self.llm, 
             tools=self.tools, 
-            prompt=SYSTEM_PROMPT
+            prompt=SYSTEM_PROMPT,
+            checkpointer=self.memory  # <-- PASANG MEMORY KE AGENT
         )
 
     def _format_context(self, docs: List[Document]) -> str:
@@ -102,15 +106,18 @@ class CodebaseSynthesizer:
             formatted_blocks.append(block)
         return "\n".join(formatted_blocks)
 
-    def stream_answer_events(self, question: str, target_folders: List[str] = None):
-        """Menghasilkan (yield) status aktivitas agent satu-persatu."""
-        self.last_sources = [] # Reset referensi sebelumnya
+    def stream_answer_events(self, question: str, target_folders: List[str] = None, thread_id: str = "default_thread"):
+        """Menghasilkan (yield) status aktivitas agent satu-persatu dengan dukungan memori."""
+        self.last_sources = [] 
         
         if target_folders:
             question = f"{question}\n\n[Catatan Sistem: Fokuskan pencarian codebase pada folder {', '.join(target_folders)} jika memungkinkan.]"
 
-        # LangGraph Stream Event Loop
-        for event in self.agent_executor.stream({"messages": [("user", question)]}):
+        # Konfigurasi unik per percakapan agar agent ingat konteks
+        config = {"configurable": {"thread_id": thread_id}}
+
+        # LangGraph Stream Event Loop (Pass config ke dalam stream)
+        for event in self.agent_executor.stream({"messages": [("user", question)]}, config=config):
             if "agent" in event:
                 last_message = event["agent"]["messages"][-1]
                 
