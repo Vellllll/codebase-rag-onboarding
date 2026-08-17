@@ -144,7 +144,10 @@ class IncrementalCodebaseIndexer:
                             )
                             documents.append(doc)
                     except Exception as e:
-                        print(f"  Error parsing {file_path}: {e}")
+                        print(f"  [ERROR INDEXER] Gagal memproses {file_path}: {e}")
+                        # Jangan ditelan diam-diam, tampilkan log ke console
+                        import sys
+                        sys.stdout.flush()
 
         print(f"  Total {len(documents)} chunk berhasil diproses!")
         return documents

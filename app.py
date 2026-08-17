@@ -223,8 +223,8 @@ with st.sidebar:
             st.error("Format URL GitHub tidak valid. Contoh: https://github.com/user/repo")
         else:
             st.session_state.indexing_in_progress = True
-            with st.status("📦 Memproses Repositori...", expanded=True) as status:
-                try:
+            try:
+                with st.status("📦 Memproses Repositori...", expanded=True) as status:
                     st.write("⬇️ Mengunduh repository...")
                     indexer = IncrementalCodebaseIndexer()
 
@@ -249,15 +249,15 @@ with st.sidebar:
                             label="⚠️ Tidak ada file kode yang cocok untuk diproses.",
                             state="error"
                         )
-                        st.caption(
-                            "Cek lagi target folder yang kamu isi, atau pastikan repo berisi "
-                            "file berekstensi .ts/.tsx/.js/.jsx/.py."
-                        )
-                except Exception as e:
-                    status.update(label="❌ Gagal memproses repositori.", state="error")
-                    st.error(f"Detail error: {e}")
-            st.session_state.indexing_in_progress = False
-            st.rerun()
+            except Exception as e:
+                st.error(f"❌ Detail Error: {e}")
+                # Print ke console agar LOG STREAMLIT CLOUD PASTI MENCETAK ERRORNYA
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Pastikan state selalu di-reset agar tombol tidak mengunci diam-diam
+                st.session_state.indexing_in_progress = False
+                st.rerun()
 
     st.divider()
     st.header("🔍 Filter Pencarian Chat")
