@@ -91,6 +91,43 @@ def save_index_metadata(repo_url: str, total_chunks: int):
             "indexed_at": datetime.now().isoformat(timespec="seconds"),
         }, f)
 
+USER_QUOTA_PATH = "./qdrant_storage/user_quotas.json"
+
+def get_user_usage(username: str) -> int:
+    """Mengambil jumlah prompt user hari ini."""
+    hari_ini = str(datetime.now().date())
+    if os.path.exists(USER_QUOTA_PATH):
+        try:
+            with open(USER_QUOTA_PATH, "r") as f:
+                data = json.load(f)
+            # Jika user ada dan tanggalnya adalah hari ini, kembalikan jumlahnya
+            if username in data and data[username]["date"] == hari_ini:
+                return data[username]["count"]
+        except Exception:
+            return 0
+    return 0
+
+def increment_user_usage(username: str):
+    """Menambah hitungan prompt user sebesar 1."""
+    hari_ini = str(datetime.now().date())
+    data = {}
+    if os.path.exists(USER_QUOTA_PATH):
+        try:
+            with open(USER_QUOTA_PATH, "r") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+
+    # Jika user belum ada atau hari sudah berganti, reset ke 1
+    if username not in data or data[username]["date"] != hari_ini:
+        data[username] = {"date": hari_ini, "count": 1}
+    else:
+        # Jika hari yang sama, tambah 1
+        data[username]["count"] += 1
+
+    os.makedirs(os.path.dirname(USER_QUOTA_PATH), exist_ok=True)
+    with open(USER_QUOTA_PATH, "w") as f:
+        json.dump(data, f)
 
 def format_relative_time(iso_str: str) -> str:
     try:
@@ -304,8 +341,10 @@ with st.sidebar:
     st.divider()
     
     # Pindahkan evaluasi limit ke sini agar bisa digunakan untuk memblokir tombol
-    MAX_MESSAGES = 2
-    limit_tercapai = len(st.session_state.messages) >= MAX_MESSAGES
+    MAX_PROMPTS = 1
+    username_aktif = st.session_state["username"]
+    prompt_terpakai = get_user_usage(username_aktif)
+    limit_tercapai = prompt_terpakai >= MAX_PROMPTS
 
     # Tombol akan mati jika chat kosong ATAU jika limit sudah tercapai
     if st.button("🗑️ Hapus Riwayat Chat", use_container_width=True, disabled=(not st.session_state.messages) or limit_tercapai):
@@ -381,12 +420,10 @@ limit_tercapai = len(st.session_state.messages) >= MAX_MESSAGES
 if limit_tercapai:
     st.error(
         "🛑 **Batas Percakapan Harian Tercapai!**\n\n"
-        "Anda telah mencapai batas maksimal instruksi untuk hari ini. "
-        "Akses chat dan fitur reset riwayat telah dikunci otomatis oleh sistem untuk mencegah kelebihan beban server. "
-        "Silakan kembali lagi besok saat kuota percakapan Anda di-reset!"
+        f"Anda telah menggunakan {MAX_PROMPTS}/{MAX_PROMPTS} kuota pertanyaan untuk hari ini. "
+        "Akses chat telah dikunci otomatis oleh sistem. Silakan kembali lagi besok!"
     )
 
-# User Input (akan disable jika belum index ATAU jika limit tercapai)
 chat_placeholder = (
     "Tanyakan sesuatu tentang codebase ini..."
     if has_index else
@@ -395,11 +432,13 @@ chat_placeholder = (
 
 if prompt := st.chat_input(chat_placeholder, disabled=(not has_index) or limit_tercapai):
     
-    # 🔒 BACKEND HARD-STOP
-    if limit_tercapai:
+    # 🔒 BACKEND HARD-STOP (Pencegahan bypass lokal/refresh)
+    if get_user_usage(username_aktif) >= MAX_PROMPTS:
         st.toast("⚠️ Akses ditolak: Kuota harian habis!", icon="🛑")
         st.stop()
-    # ==========================================
+        
+    # ✔️ CATAT PENGGUNAAN KE FILE JSON
+    increment_user_usage(username_aktif)
 
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="👤"):
