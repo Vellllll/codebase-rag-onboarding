@@ -149,6 +149,32 @@ def load_synthesizer():
     return CodebaseSynthesizer()
 
 
+import datetime
+import streamlit as st
+
+# ==========================================
+# LOGIKA RESET SESI HARIAN (MIDNIGHT RESET)
+# ==========================================
+hari_ini = datetime.date.today()
+
+# 1. Jika pengguna baru pertama kali membuka aplikasi hari ini, simpan tanggalnya
+if "session_date" not in st.session_state:
+    st.session_state.session_date = hari_ini
+
+# 2. Cek apakah tanggal saat ini berbeda (lebih baru) dari tanggal sesi yang tersimpan
+if hari_ini > st.session_state.session_date:
+    # Kosongkan riwayat pesan
+    st.session_state.messages = []
+    
+    # Update tanggal sesi menjadi hari ini
+    st.session_state.session_date = hari_ini
+    
+    # Beri tahu pengguna bahwa percakapan telah di-refresh
+    st.toast("Hari berganti! Ingatan Agent telah direset untuk sesi hari ini.", icon="🌅")
+
+# ==========================================
+# INISIALISASI STATE LAINNYA
+# ==========================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "indexing_in_progress" not in st.session_state:
@@ -257,11 +283,9 @@ with st.sidebar:
                         )
             except Exception as e:
                 st.error(f"❌ Detail Error: {e}")
-                # Print ke console agar LOG STREAMLIT CLOUD PASTI MENCETAK ERRORNYA
                 import traceback
                 traceback.print_exc()
             finally:
-                # Pastikan state selalu di-reset agar tombol tidak mengunci diam-diam
                 st.session_state.indexing_in_progress = False
                 st.rerun()
 
@@ -272,16 +296,19 @@ with st.sidebar:
         placeholder="src/components, src/api",
         help=(
             "Membatasi PENCARIAN dari index yang sudah ada — tidak perlu re-index, "
-            "bisa diganti kapan saja per pertanyaan. Index-nya sendiri tidak berubah. "
-            "Catatan: kalau folder ini tidak termasuk dalam Target Folder saat indexing, "
-            "hasilnya akan kosong karena memang belum pernah di-index. "
-            "Kosongkan untuk mencari di seluruh repositori yang sudah ter-index."
+            "bisa diganti kapan saja per pertanyaan. Index-nya sendiri tidak berubah."
         ),
         disabled=not has_index
     )
 
     st.divider()
-    if st.button("🗑️ Hapus Riwayat Chat", use_container_width=True, disabled=not st.session_state.messages):
+    
+    # Pindahkan evaluasi limit ke sini agar bisa digunakan untuk memblokir tombol
+    MAX_MESSAGES = 2
+    limit_tercapai = len(st.session_state.messages) >= MAX_MESSAGES
+
+    # Tombol akan mati jika chat kosong ATAU jika limit sudah tercapai
+    if st.button("🗑️ Hapus Riwayat Chat", use_container_width=True, disabled=(not st.session_state.messages) or limit_tercapai):
         st.session_state.messages = []
         st.session_state.thread_id = str(uuid.uuid4()) # RESET INGATAN AGENT
         st.rerun()
@@ -339,14 +366,41 @@ for message in st.session_state.messages:
         if message.get("sources"):
             render_sources(message["sources"])
 
-# User Input
+
+# =====================================================================
+# --- LOGIKA LIMITASI TURN CHAT ---
+# =====================================================================
+MAX_MESSAGES = 2  # Batas 10 pertanyaan user + 10 jawaban AI
+limit_tercapai = len(st.session_state.messages) >= MAX_MESSAGES
+
+# =====================================================================
+# --- LOGIKA LIMITASI TURN CHAT ---
+# =====================================================================
+# (limit_tercapai sudah dievaluasi di sidebar)
+
+if limit_tercapai:
+    st.error(
+        "🛑 **Batas Percakapan Harian Tercapai!**\n\n"
+        "Anda telah mencapai batas maksimal instruksi untuk hari ini. "
+        "Akses chat dan fitur reset riwayat telah dikunci otomatis oleh sistem untuk mencegah kelebihan beban server. "
+        "Silakan kembali lagi besok saat kuota percakapan Anda di-reset!"
+    )
+
+# User Input (akan disable jika belum index ATAU jika limit tercapai)
 chat_placeholder = (
     "Tanyakan sesuatu tentang codebase ini..."
     if has_index else
     "Hubungkan repositori dulu di panel kiri untuk mulai bertanya"
 )
 
-if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
+if prompt := st.chat_input(chat_placeholder, disabled=(not has_index) or limit_tercapai):
+    
+    # 🔒 BACKEND HARD-STOP
+    if limit_tercapai:
+        st.toast("⚠️ Akses ditolak: Kuota harian habis!", icon="🛑")
+        st.stop()
+    # ==========================================
+
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="👤"):
         st.markdown(prompt)
@@ -367,8 +421,6 @@ if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
             ]
 
         # Inisialisasi UI dinamis
-        # Inisialisasi UI dinamis
-        # Ubah expanded menjadi False agar kotaknya tertutup sejak awal
         status = st.status("🧠 AI sedang berpikir...", expanded=False) 
         message_placeholder = st.empty()
         full_answer = ""
@@ -379,7 +431,7 @@ if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
             stream_generator = synthesizer.stream_answer_events(
                 prompt, 
                 target_folders=target_folders_list,
-                thread_id=st.session_state.thread_id  # <--- PARAMETER BARU
+                thread_id=st.session_state.thread_id
             )
             
             for event in stream_generator:
@@ -392,14 +444,12 @@ if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
                     elif tool_name == "read_file_content":
                         status.update(label="📄 Sedang membaca isi file secara utuh...")
                     elif tool_name == "web_search":
-                        status.update(label="🌐 Sedang mencari referensi/dokumentasi dari internet...")
+                        status.update(label="🌐 Sedang mencari referensi dari internet...")
                         
                 elif event["type"] == "final_answer":
-                    # Update label saat selesai
                     status.update(label="✅ Selesai menganalisis", state="complete")
                     full_answer = event["content"]
                     
-                    # Simulasi efek mengetik (typing effect)
                     typed_text = ""
                     for word in full_answer.split(" "):
                         typed_text += word + " "
@@ -412,13 +462,13 @@ if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
             st.error(f"Gagal memproses jawaban: {e}")
             st.stop()
 
-        # Ekstrak diagram Mermaid jika ada
+        # Ekstrak diagram Mermaid
         mermaid_code = extract_mermaid_code(full_answer)
         if mermaid_code:
             st.caption("📊 Diagram Arsitektur")
             st_mermaid(mermaid_code)
 
-        # Mengambil daftar file kode sumber hasil penelusuran agent
+        # Mengambil daftar file sumber
         sources = synthesizer.last_sources
         if sources:
             if target_folders_list:
