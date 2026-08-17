@@ -47,7 +47,13 @@ class CodebaseSynthesizer:
         # Direktori basis repositori yang sudah di-clone (Langkah 1)
         self.base_repo_path = os.path.abspath("./cloned_repo")
         
-        self.web_search = DuckDuckGoSearchRun(name="web_search")
+        try:
+            self.web_search = DuckDuckGoSearchRun(name="web_search")
+            self.tools = [search_codebase, list_directory, read_file_content, self.web_search]
+        except Exception as e:
+            print(f"⚠️ Warning: Gagal memuat web_search tool: {e}")
+            # Fallback jika DuckDuckGo gagal di-load di server cloud
+            self.tools = [search_codebase, list_directory, read_file_content]
         
         @tool
         def search_codebase(query: str) -> str:

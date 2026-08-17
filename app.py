@@ -13,8 +13,14 @@ import streamlit_authenticator as stauth
 # Load environment variables
 load_dotenv()
 
-from src.synthesizer import CodebaseSynthesizer
-from src.indexer import IncrementalCodebaseIndexer
+try:
+    from src.synthesizer import CodebaseSynthesizer
+    from src.indexer import IncrementalCodebaseIndexer
+except Exception as e:
+    import traceback
+    st.error(f"❌ Gagal mengimpor modul internal: {e}")
+    traceback.print_exc()
+    st.stop()
 
 # =====================================================================
 # --- KONFIGURASI HALAMAN ---
