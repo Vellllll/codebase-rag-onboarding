@@ -3,48 +3,79 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
+from langchain_core.tools import tool
+from langchain_community.tools import DuckDuckGoSearchRun
+from langgraph.prebuilt import create_react_agent
 
 from src.retriever import HybridCodeRetriever
 
 load_dotenv()
 
-SYSTEM_PROMPT = """Anda adalah Senior Software Architect & Codebase Onboarding Mentor.
-Tugas Anda adalah membantu developer memahami arsitektur kode dan riwayat perubahan repositori berdasarkan context yang diberikan.
+SYSTEM_PROMPT = """Anda adalah Senior Software Architect & Codebase Onboarding Mentor. 
+Tugas Anda adalah membantu developer memahami arsitektur kode dan riwayat perubahan repositori, 
+serta mencari informasi dari internet jika diperlukan (misalnya untuk dokumentasi eksternal).
 
 ATURAN UTAMA:
-1. JAWAB BERDASARKAN KONTEKS KODE & METADATA GIT YANG DIBERIKAN.
-2. JIKA USER BERTANYA TENTANG RIWAYAT/PEMBUAT KODE: Sebutkan Nama Author, Commit Hash, Tanggal, dan Pesan Commit dari metadata yang tersedia.
-3. REFERENSI LOKASI: Selalu sertakan file path dan nomor baris (contoh: `src/auth.ts` Baris 12-30).
-4. DIAGRAM MERMAID.JS: Buat diagram ```mermaid ... ``` jika user meminta gambaran alur data/arsitektur.
-
-KONTEKS KODE DARI REPOSITORI:
-{context}
+1. Gunakan tool `search_codebase` untuk mencari konteks dari repositori lokal.
+2. Gunakan tool `web_search` JIKA informasi tidak ada di codebase atau butuh referensi dokumentasi terbaru dari internet.
+3. JIKA USER BERTANYA TENTANG RIWAYAT/PEMBUAT KODE: Sebutkan Nama Author, Commit Hash, Tanggal, dan Pesan Commit dari metadata yang tersedia.
+4. REFERENSI LOKASI: Selalu sertakan file path dan nomor baris (contoh: `src/auth.ts` Baris 12-30) jika merujuk ke kode.
+5. DIAGRAM MERMAID.JS: Buat diagram ```mermaid ... ``` jika user meminta gambaran alur data/arsitektur.
 """
 
 class CodebaseSynthesizer:
     def __init__(self, model_name: str = "deepseek-chat"):
         self.retriever = HybridCodeRetriever()
         
+        # Variabel untuk melacak kode lokal yang ditemukan oleh Tool
+        self.last_sources = []
+        
         # --- KONFIGURASI DEEPSEEK API ---
         deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-        
         if not deepseek_api_key:
             raise ValueError("DEEPSEEK_API_KEY tidak ditemukan di file .env!")
-
-        # Mengarahkan ChatOpenAI ke endpoint DeepSeek
+            
         self.llm = ChatOpenAI(
-            model=model_name,                 # "deepseek-chat" atau "deepseek-coder"
+            model=model_name,
             openai_api_key=deepseek_api_key,
             openai_api_base="https://api.deepseek.com",
             temperature=0.2
         )
         
-        self.prompt_template = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            ("user", "{question}")
-        ])
+        # 1. Definisi Tools untuk Agent
+        self.web_search = DuckDuckGoSearchRun(
+            name="web_search",
+            description="Gunakan ini untuk mencari informasi umum, dokumentasi library, atau error di internet."
+        )
+        
+        @tool
+        def search_codebase(query: str) -> str:
+            """Gunakan tool ini HANYA untuk mencari struktur kode, fungsi, class, dan riwayat git di dalam repositori lokal."""
+            docs = self.retriever.get_relevant_code(query, top_k=3)
+            
+            # Simpan metadata dokumen agar UI bisa menampilkannya
+            self.last_sources = [
+                {
+                    "file_path": doc.metadata.get("file_path"),
+                    "start_line": doc.metadata.get("start_line"),
+                    "end_line": doc.metadata.get("end_line"),
+                    "name": doc.metadata.get("name")
+                } for doc in docs
+            ]
+            
+            if not docs:
+                return "Tidak ada kode yang relevan ditemukan di repositori."
+            return self._format_context(docs)
+
+        self.tools = [search_codebase, self.web_search]
+        
+        # 2. Inisialisasi Agent LangGraph
+        self.agent_executor = create_react_agent(
+            model=self.llm, 
+            tools=self.tools, 
+            prompt=SYSTEM_PROMPT
+        )
 
     def _format_context(self, docs: List[Document]) -> str:
         formatted_blocks = []
@@ -56,12 +87,11 @@ class CodebaseSynthesizer:
             code_type = meta.get("code_type", "code")
             name = meta.get("name", "anonymous")
             
-            # Metadata Git
             author = meta.get("author", "Unknown")
             commit_hash = meta.get("commit_hash", "")
             commit_date = meta.get("commit_date", "")
             commit_msg = meta.get("commit_message", "")
-
+            
             block = (
                 f"--- [SNIPPET #{idx}] ---\n"
                 f"File Path   : {file_path} (Baris {start_line}-{end_line})\n"
@@ -70,62 +100,24 @@ class CodebaseSynthesizer:
                 f"Code:\n{doc.page_content}\n"
             )
             formatted_blocks.append(block)
-            
         return "\n".join(formatted_blocks)
 
-    def answer_question(self, question: str, target_folders: List[str] = None) -> Dict[str, Any]:
-        relevant_docs = self.retriever.get_relevant_code(
-            question, 
-            top_k=3, 
-            target_folders=target_folders
-        )
+    def stream_answer_events(self, question: str, target_folders: List[str] = None):
+        """Menghasilkan (yield) status aktivitas agent satu-persatu."""
+        self.last_sources = [] # Reset referensi sebelumnya
         
-        if not relevant_docs:
-            return {
-                "answer": "Maaf, saya tidak menemukan kode yang relevan di dalam repositori untuk menjawab pertanyaan tersebut.",
-                "sources": []
-            }
+        if target_folders:
+            question = f"{question}\n\n[Catatan Sistem: Fokuskan pencarian codebase pada folder {', '.join(target_folders)} jika memungkinkan.]"
 
-        context_str = self._format_context(relevant_docs)
-
-        chain = self.prompt_template | self.llm
-        response = chain.invoke({
-            "context": context_str,
-            "question": question
-        })
-
-        sources = [
-            {
-                "file_path": doc.metadata.get("file_path"),
-                "start_line": doc.metadata.get("start_line"),
-                "end_line": doc.metadata.get("end_line"),
-                "name": doc.metadata.get("name")
-            }
-            for doc in relevant_docs
-        ]
-
-        return {
-            "answer": response.content,
-            "sources": sources
-        }
-    
-    def stream_answer(self, question: str, target_folders: List[str] = None):
-        """Streaming jawaban dari LLM token demi token."""
-        relevant_docs = self.retriever.get_relevant_code(
-            question, 
-            top_k=3, 
-            target_folders=target_folders
-        )
-        
-        if not relevant_docs:
-            yield "Maaf, saya tidak menemukan kode yang relevan di dalam repositori untuk menjawab pertanyaan tersebut."
-            return
-
-        context_str = self._format_context(relevant_docs)
-
-        chain = self.prompt_template | self.llm
-        
-        # Gunakan chain.stream() untuk mengalirkan teks secara real-time
-        for chunk in chain.stream({"context": context_str, "question": question}):
-            if chunk.content:
-                yield chunk.content
+        # LangGraph Stream Event Loop
+        for event in self.agent_executor.stream({"messages": [("user", question)]}):
+            if "agent" in event:
+                last_message = event["agent"]["messages"][-1]
+                
+                # Jika agent memutuskan memanggil tools
+                if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+                    for tc in last_message.tool_calls:
+                        yield {"type": "tool_start", "tool": tc["name"], "query": tc.get("args")}
+                # Jika agent memberikan jawaban akhir
+                elif last_message.content:
+                    yield {"type": "final_answer", "content": last_message.content}

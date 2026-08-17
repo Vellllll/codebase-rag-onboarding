@@ -253,7 +253,7 @@ with st.sidebar:
                     status.update(label="❌ Gagal memproses repositori.", state="error")
                     st.error(f"Detail error: {e}")
             st.session_state.indexing_in_progress = False
-            # st.rerun()
+            st.rerun()
 
     st.divider()
     st.header("🔍 Filter Pencarian Chat")
@@ -355,50 +355,62 @@ if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
                 if folder.strip()
             ]
 
-        with st.spinner("🔎 Menelusuri kode yang relevan..."):
-            try:
-                relevant_docs = synthesizer.retriever.get_relevant_code(
-                    prompt,
-                    top_k=3,
-                    target_folders=target_folders_list
-                )
-            except Exception as e:
-                st.error(f"Gagal mengambil konteks kode: {e}")
-                st.stop()
+        # Inisialisasi UI dinamis
+        # Inisialisasi UI dinamis
+        # Ubah expanded menjadi False agar kotaknya tertutup sejak awal
+        status = st.status("🧠 AI sedang berpikir...", expanded=False) 
+        message_placeholder = st.empty()
+        full_answer = ""
+        
+        import time
+        try:
+            # Membaca kejadian (event) dari Agent
+            for event in synthesizer.stream_answer_events(prompt, target_folders=target_folders_list):
+                
+                if event["type"] == "tool_start":
+                    tool_name = event["tool"]
+                    # Gunakan status.update(label=...) BUKAN status.write(...)
+                    # Ini akan menimpa teks utama di luar kotak, tanpa membuat daftar panjang ke bawah
+                    if tool_name == "search_codebase":
+                        status.update(label="🔍 Sedang menelusuri kode di repositori lokal...")
+                    elif tool_name == "web_search":
+                        status.update(label="🌐 Sedang mencari referensi/dokumentasi dari internet...")
+                        
+                elif event["type"] == "final_answer":
+                    # Update label saat selesai
+                    status.update(label="✅ Selesai menganalisis", state="complete")
+                    full_answer = event["content"]
+                    
+                    # Simulasi efek mengetik (typing effect)
+                    typed_text = ""
+                    for word in full_answer.split(" "):
+                        typed_text += word + " "
+                        message_placeholder.markdown(typed_text + "▌")
+                        time.sleep(0.015) 
+                    message_placeholder.markdown(full_answer)
 
-        sources = [
-            {
-                "file_path": doc.metadata.get("file_path"),
-                "start_line": doc.metadata.get("start_line"),
-                "end_line": doc.metadata.get("end_line"),
-                "name": doc.metadata.get("name")
-            }
-            for doc in relevant_docs
-        ]
+        except Exception as e:
+            status.update(label="❌ Terjadi Kesalahan", state="error")
+            st.error(f"Gagal memproses jawaban: {e}")
+            st.stop()
 
-        if target_folders_list and not relevant_docs:
-            st.warning(
-                f"Tidak ditemukan kode relevan di folder: {', '.join(target_folders_list)}. "
-                "Coba kosongkan filter folder atau periksa kembali nama foldernya."
-            )
-
-        answer_text = st.write_stream(
-            synthesizer.stream_answer(prompt, target_folders=target_folders_list)
-        )
-
-        mermaid_code = extract_mermaid_code(answer_text)
+        # Ekstrak diagram Mermaid jika ada
+        mermaid_code = extract_mermaid_code(full_answer)
         if mermaid_code:
             st.caption("📊 Diagram Arsitektur")
             st_mermaid(mermaid_code)
 
+        # Mengambil daftar file kode sumber hasil penelusuran agent
+        sources = synthesizer.last_sources
         if sources:
             if target_folders_list:
                 st.caption(f"🔍 Pencarian difokuskan pada folder: {', '.join(target_folders_list)}")
             render_sources(sources)
 
+        # Simpan ke riwayat chat
         st.session_state.messages.append({
             "role": "assistant",
-            "content": answer_text,
+            "content": full_answer,
             "mermaid_code": mermaid_code,
             "sources": sources
         })
