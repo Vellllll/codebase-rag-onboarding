@@ -158,18 +158,23 @@ class CodebaseSynthesizer:
         if target_folders:
             question = f"{question}\n\n[Catatan Sistem: Fokuskan pencarian codebase pada folder {', '.join(target_folders)} jika memungkinkan.]"
 
-        # Konfigurasi unik per percakapan agar agent ingat konteks
-        config = {"configurable": {"thread_id": thread_id}}
+        # Tambahkan recursion_limit untuk mencegah infinite loop!
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": 10  # Maksimal 10 kali putaran (Thought -> Action)
+        }
 
         # LangGraph Stream Event Loop (Pass config ke dalam stream)
-        for event in self.agent_executor.stream({"messages": [("user", question)]}, config=config):
-            if "agent" in event:
-                last_message = event["agent"]["messages"][-1]
-                
-                # Jika agent memutuskan memanggil tools
-                if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                    for tc in last_message.tool_calls:
-                        yield {"type": "tool_start", "tool": tc["name"], "query": tc.get("args")}
-                # Jika agent memberikan jawaban akhir
-                elif last_message.content:
-                    yield {"type": "final_answer", "content": last_message.content}
+        try:
+            for event in self.agent_executor.stream({"messages": [("user", question)]}, config=config):
+                if "agent" in event:
+                    last_message = event["agent"]["messages"][-1]
+                    
+                    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+                        for tc in last_message.tool_calls:
+                            yield {"type": "tool_start", "tool": tc["name"], "query": tc.get("args")}
+                    elif last_message.content:
+                        yield {"type": "final_answer", "content": last_message.content}
+        except Exception as e:
+            # Menangkap error jika batas rekursi terlewati
+            yield {"type": "final_answer", "content": "Mohon maaf, saya menghentikan proses pencarian karena instruksi terlalu kompleks dan menyebabkan looping berlebihan. Coba pecah pertanyaan Anda menjadi langkah-langkah yang lebih kecil."}
