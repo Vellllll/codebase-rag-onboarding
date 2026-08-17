@@ -338,7 +338,7 @@ with st.sidebar:
     st.divider()
     
     # Pindahkan evaluasi limit ke sini agar bisa digunakan untuk memblokir tombol
-    MAX_PROMPTS = 1
+    MAX_PROMPTS = 10
     username_aktif = st.session_state["username"]
     prompt_terpakai = get_user_usage(username_aktif)
     limit_tercapai = prompt_terpakai >= MAX_PROMPTS
@@ -406,7 +406,7 @@ for message in st.session_state.messages:
 # =====================================================================
 # --- LOGIKA LIMITASI TURN CHAT ---
 # =====================================================================
-MAX_MESSAGES = 2  # Batas 10 pertanyaan user + 10 jawaban AI
+MAX_MESSAGES = 10  # Batas 10 pertanyaan user + 10 jawaban AI
 limit_tercapai = len(st.session_state.messages) >= MAX_MESSAGES
 
 # =====================================================================
