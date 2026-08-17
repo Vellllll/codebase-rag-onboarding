@@ -73,8 +73,12 @@ class CodebaseSynthesizer:
             
         return "\n".join(formatted_blocks)
 
-    def answer_question(self, question: str) -> Dict[str, Any]:
-        relevant_docs = self.retriever.get_relevant_code(question, top_k=3)
+    def answer_question(self, question: str, target_folders: List[str] = None) -> Dict[str, Any]:
+        relevant_docs = self.retriever.get_relevant_code(
+            question, 
+            top_k=3, 
+            target_folders=target_folders
+        )
         
         if not relevant_docs:
             return {
@@ -105,9 +109,13 @@ class CodebaseSynthesizer:
             "sources": sources
         }
     
-    def stream_answer(self, question: str):
+    def stream_answer(self, question: str, target_folders: List[str] = None):
         """Streaming jawaban dari LLM token demi token."""
-        relevant_docs = self.retriever.get_relevant_code(question, top_k=3)
+        relevant_docs = self.retriever.get_relevant_code(
+            question, 
+            top_k=3, 
+            target_folders=target_folders
+        )
         
         if not relevant_docs:
             yield "Maaf, saya tidak menemukan kode yang relevan di dalam repositori untuk menjawab pertanyaan tersebut."

@@ -1,7 +1,9 @@
 import streamlit as st
 import os
 import re
+import json
 import yaml
+from datetime import datetime
 from yaml.loader import SafeLoader
 from streamlit_mermaid import st_mermaid
 from dotenv import load_dotenv
@@ -10,24 +12,111 @@ import streamlit_authenticator as stauth
 # Load environment variables
 load_dotenv()
 
-# Import Synthesizer & Indexer dari backend
 from src.synthesizer import CodebaseSynthesizer
 from src.indexer import IncrementalCodebaseIndexer
 
-# --- KONFIGURASI HALAMAN STREAMLIT ---
+# =====================================================================
+# --- KONFIGURASI HALAMAN ---
+# =====================================================================
 st.set_page_config(
-    page_title="AI Codebase Onboarding Assistant",
-    page_icon="🤖",
-    layout="wide"
+    page_title="Codebase AI Mentor",
+    page_icon="🧩",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# --- SISTEM LOGIN (STREAMLIT AUTHENTICATOR) ---
-# Membaca data akun dari config.yaml
+INDEX_METADATA_PATH = "./qdrant_storage/index_metadata.json"
+
+st.markdown("""
+<style>
+    .stAppDeployButton {display:none;}
+    h1 {font-weight: 700; color: #1E3A8A;}
+    .stChatInput {border-radius: 15px;}
+
+    .status-card {
+        background-color: #F0F4FF;
+        border: 1px solid #C7D6FF;
+        border-radius: 10px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.75rem;
+    }
+    .status-card.empty {
+        background-color: #FFF7ED;
+        border: 1px solid #FED7AA;
+    }
+    .status-card b { color: #1E3A8A; }
+    .status-card.empty b { color: #9A3412; }
+    .status-sub { font-size: 0.8rem; color: #6B7280; margin-top: 2px; }
+
+    .source-pill {
+        display: inline-block;
+        background-color: #EEF2FF;
+        color: #3730A3;
+        border-radius: 999px;
+        padding: 2px 10px;
+        font-size: 0.78rem;
+        margin: 2px 4px 2px 0;
+        font-family: monospace;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# =====================================================================
+# --- HELPER: METADATA INDEX (agar status bertahan antar-reload) ---
+# =====================================================================
+def load_index_metadata():
+    if os.path.exists(INDEX_METADATA_PATH):
+        try:
+            with open(INDEX_METADATA_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def save_index_metadata(repo_url: str, total_chunks: int):
+    os.makedirs(os.path.dirname(INDEX_METADATA_PATH), exist_ok=True)
+    with open(INDEX_METADATA_PATH, "w") as f:
+        json.dump({
+            "repo_url": repo_url,
+            "total_chunks": total_chunks,
+            "indexed_at": datetime.now().isoformat(timespec="seconds"),
+        }, f)
+
+
+def format_relative_time(iso_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        delta = datetime.now() - dt
+        seconds = int(delta.total_seconds())
+        if seconds < 60:
+            return "baru saja"
+        if seconds < 3600:
+            return f"{seconds // 60} menit lalu"
+        if seconds < 86400:
+            return f"{seconds // 3600} jam lalu"
+        return f"{seconds // 86400} hari lalu"
+    except Exception:
+        return ""
+
+
+def is_valid_github_url(url: str) -> bool:
+    return bool(re.match(r"^https://github\.com/[\w.-]+/[\w.-]+/?$", url.strip()))
+
+
+# =====================================================================
+# --- SISTEM LOGIN ---
+# =====================================================================
+if not os.path.exists('.streamlit/config.yaml'):
+    st.error("⚠️ File konfigurasi `.streamlit/config.yaml` tidak ditemukan. Aplikasi tidak bisa dijalankan.")
+    st.stop()
+
 with open('.streamlit/config.yaml') as file:
     config = yaml.load(file, Loader=SafeLoader)
 
-# Inisialisasi Authenticator
-# Inisialisasi Authenticator (TANPA config['preauthorized'])
+stauth.Hasher.hash_passwords(config['credentials'])
+
 authenticator = stauth.Authenticate(
     config['credentials'],
     config['cookie']['name'],
@@ -35,119 +124,248 @@ authenticator = stauth.Authenticate(
     config['cookie']['expiry_days']
 )
 
-# Render widget login (Pembaruan v3.x menggunakan keyword 'location')
 authenticator.login(location="main")
 
-# Pengecekan status menggunakan st.session_state
 if st.session_state["authentication_status"] is False:
     st.error("❌ Username atau password salah!")
-    st.stop() # Hentikan aplikasi jika gagal login
+    st.stop()
 elif st.session_state["authentication_status"] is None:
-    st.warning("🔒 Silakan masukkan username dan password Anda.")
-    st.stop() # Hentikan aplikasi jika belum login
+    st.info("👋 Selamat datang! Silakan login untuk mengeksplorasi codebase.")
+    st.stop()
 
 # =====================================================================
-# --- KODE APLIKASI UTAMA (HANYA BERJALAN JIKA LOGIN BERHASIL) ---
+# --- APLIKASI UTAMA (SETELAH LOGIN) ---
 # =====================================================================
 
-# Tampilkan tombol Logout di Sidebar
-with st.sidebar:
-    st.write(f"Selamat datang, **{st.session_state['name']}**! 👋")
-    authenticator.logout(location="sidebar")
-    st.markdown("---")
-
-# --- CACHING BACKEND ENGINE ---
 @st.cache_resource
 def load_synthesizer():
     return CodebaseSynthesizer()
 
-@st.cache_resource
-def load_indexer() -> IncrementalCodebaseIndexer:
-    return IncrementalCodebaseIndexer()
 
-# --- INITIALIZATION & SESSION STATE ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "indexing_in_progress" not in st.session_state:
+    st.session_state.indexing_in_progress = False
 
-# --- SIDEBAR: REPOSITORY MANAGEMENT ---
+index_meta = load_index_metadata()
+has_index = index_meta is not None
+
+# =====================================================================
+# --- SIDEBAR ---
+# =====================================================================
 with st.sidebar:
-    st.header("⚙️ Repository Settings")
-    
+    st.markdown(f"### 👤 Hai, {st.session_state['name']}!")
+    authenticator.logout("Keluar", location="sidebar")
+    st.divider()
+
+    # --- STATUS REPO (persisten antar reload) ---
+    if has_index:
+        st.markdown(
+            f"""<div class="status-card">
+                ✅ <b>Repo terhubung</b><br>
+                <code>{index_meta['repo_url']}</code>
+                <div class="status-sub">
+                    {index_meta['total_chunks']} chunk kode &middot;
+                    diindeks {format_relative_time(index_meta['indexed_at'])}
+                </div>
+            </div>""",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            """<div class="status-card empty">
+                ⚠️ <b>Belum ada repo terhubung</b>
+                <div class="status-sub">Hubungkan repositori di bawah untuk mulai bertanya.</div>
+            </div>""",
+            unsafe_allow_html=True
+        )
+
+    st.header("⚙️ Hubungkan Repositori")
+
     github_url_input = st.text_input(
-        "GitHub Repository URL:", 
-        placeholder="https://github.com/username/repo-name"
+        "🔗 GitHub URL",
+        placeholder="https://github.com/facebook/react"
     )
-    
-    github_token_input = st.text_input(
-        "GitHub Access Token (PAT):",
-        type="password",
-        help="Wajib diisi jika ingin meng-index Private Repository."
+
+    with st.expander("🛠️ Pengaturan Lanjutan (Opsional)", expanded=False):
+        github_token_input = st.text_input(
+            "🔑 GitHub PAT (Untuk Private Repo)",
+            type="password",
+            help="Masukkan Personal Access Token jika ini repositori privat."
+        )
+        target_folders_input = st.text_input(
+            "📁 Target Folder (saat Indexing)",
+            placeholder="src/api, libs/utils",
+            help=(
+                "Membatasi file mana yang DI-INDEX sejak awal. File di luar folder ini "
+                "tidak akan pernah diparse/disimpan sampai kamu re-index. Cocok untuk "
+                "monorepo besar biar indexing lebih cepat dan hemat storage."
+            )
+        )
+
+    index_button_label = "🔄 Re-index Repositori" if has_index else "🚀 Mulai Indexing"
+    index_clicked = st.button(
+        index_button_label,
+        use_container_width=True,
+        type="primary",
+        disabled=st.session_state.indexing_in_progress
     )
-    
-    if st.button("⚡ Index Repository", type="primary"):
-        if github_url_input.startswith("https://github.com/"):
-            with st.spinner("Cloning repository, parsing AST, & indexing chunks..."):
-                try:
-                    indexer = IncrementalCodebaseIndexer()
-                    total_chunks = indexer.index_from_github_url(
-                        github_url=github_url_input,
-                        github_token=github_token_input if github_token_input else None
-                    )
-                    
-                    if total_chunks > 0:
-                        st.success(f"Berhasil meng-index {total_chunks} chunk kode!")
-                        st.cache_resource.clear()
-                    else:
-                        st.warning("Tidak ditemukan file kode yang valid.")
-                except Exception as e:
-                    st.error(f"Gagal memproses repositori: {e}")
+
+    if index_clicked:
+        url_clean = github_url_input.strip()
+        if not url_clean:
+            st.error("Isi dulu GitHub URL-nya, ya.")
+        elif not is_valid_github_url(url_clean):
+            st.error("Format URL GitHub tidak valid. Contoh: https://github.com/user/repo")
         else:
-            st.error("Masukkan URL GitHub yang valid!")
+            st.session_state.indexing_in_progress = True
+            with st.status("📦 Memproses Repositori...", expanded=True) as status:
+                try:
+                    st.write("⬇️ Mengunduh repository...")
+                    indexer = IncrementalCodebaseIndexer()
 
-# --- MAIN APP INTERFACE (CHAT DLL) ---
-st.title("🤖 AI Codebase Onboarding & Architecture Assistant")
-# (Lanjutkan dengan kode chat interface, st_mermaid, dan synthesizer seperti sebelumnya...)
+                    st.write("🌳 Membedah Abstract Syntax Tree (AST)...")
+                    total_chunks = indexer.index_from_github_url(
+                        github_url=url_clean,
+                        github_token=github_token_input if github_token_input else None,
+                        target_folders_str=target_folders_input
+                    )
 
-# --- HELPER FUNCTION: PARSE MERMAID BLOCK ---
+                    if total_chunks > 0:
+                        st.cache_resource.clear()
+                        save_index_metadata(url_clean, total_chunks)
+                        st.session_state.messages = []
+                        status.update(
+                            label=f"✅ Berhasil! {total_chunks} chunk kode tersimpan.",
+                            state="complete", expanded=False
+                        )
+                        st.toast("🎉 Indexing selesai! Kamu bisa mulai bertanya.", icon="✅")
+                    else:
+                        status.update(
+                            label="⚠️ Tidak ada file kode yang cocok untuk diproses.",
+                            state="error"
+                        )
+                        st.caption(
+                            "Cek lagi target folder yang kamu isi, atau pastikan repo berisi "
+                            "file berekstensi .ts/.tsx/.js/.jsx/.py."
+                        )
+                except Exception as e:
+                    status.update(label="❌ Gagal memproses repositori.", state="error")
+                    st.error(f"Detail error: {e}")
+            st.session_state.indexing_in_progress = False
+            # st.rerun()
+
+    st.divider()
+    st.header("🔍 Filter Pencarian Chat")
+    chat_target_folders = st.text_input(
+        "Fokuskan AI pada folder (saat Chat):",
+        placeholder="src/components, src/api",
+        help=(
+            "Membatasi PENCARIAN dari index yang sudah ada — tidak perlu re-index, "
+            "bisa diganti kapan saja per pertanyaan. Index-nya sendiri tidak berubah. "
+            "Catatan: kalau folder ini tidak termasuk dalam Target Folder saat indexing, "
+            "hasilnya akan kosong karena memang belum pernah di-index. "
+            "Kosongkan untuk mencari di seluruh repositori yang sudah ter-index."
+        ),
+        disabled=not has_index
+    )
+
+    st.divider()
+    if st.button("🗑️ Hapus Riwayat Chat", use_container_width=True, disabled=not st.session_state.messages):
+        st.session_state.messages = []
+        st.rerun()
+
+    st.caption("✨ **Fitur Aktif:** Hybrid Search, RRF, Cross-Encoder, Mermaid Diagrams, Folder Filtering.")
+
+# =====================================================================
+# --- MAIN CHAT INTERFACE ---
+# =====================================================================
+st.title("🧩 Codebase AI Mentor")
+
+if not has_index:
+    st.info("💡 **Mulai di sini:** Hubungkan repositori GitHub di panel sebelah kiri sebelum memulai obrolan.")
+
+if not st.session_state.messages:
+    st.markdown("### Coba tanyakan hal seperti ini:")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.button("🔍 Di mana letak logika Autentikasi User?", use_container_width=True, disabled=True)
+        st.button("📊 Buatkan diagram alur untuk checkout keranjang", use_container_width=True, disabled=True)
+    with col2:
+        st.button("⚙️ Jelaskan arsitektur folder src/components", use_container_width=True, disabled=True)
+        st.button("👤 Siapa yang terakhir mengubah fungsi login?", use_container_width=True, disabled=True)
+
+
 def extract_mermaid_code(text: str):
-    """Mengekstrak blok kode mermaid dari teks jawaban LLM."""
     pattern = r"```mermaid\s*\n(.*?)\n```"
     match = re.search(pattern, text, re.DOTALL)
     if match:
         return match.group(1).strip()
-        
     return None
 
-# --- RENDER CHAT HISTORY ---
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        
-        # Render diagram Mermaid jika ada di history
-        if "mermaid_code" in message and message["mermaid_code"]:
-            st.caption("📊 Architecture Diagram:")
-            st_mermaid(message["mermaid_code"])
-            
-        # Render referensi file sumber jika ada di history
-        if "sources" in message and message["sources"]:
-            with st.expander("📍 Lihat Sumber Kode Referensi"):
-                for src in message["sources"]:
-                    st.markdown(f"- **`{src['file_path']}`** *(Baris {src['start_line']}-{src['end_line']})* — `{src['name']}`")
 
-# --- USER CHAT INPUT & EXECUTION ---
-if prompt := st.chat_input("Contoh: Bagaimana alur autentikasi user dan buatkan diagramnya?"):
-    
-    # 1. Tampilkan pesan user di UI & simpan di history
+def render_sources(sources):
+    with st.expander(f"📍 Sumber Kode ({len(sources)} referensi)"):
+        for src in sources:
+            st.markdown(
+                f"<span class='source-pill'>{src['file_path']} : "
+                f"{src['start_line']}-{src['end_line']}</span> "
+                f"**{src['name']}**",
+                unsafe_allow_html=True
+            )
+
+
+# Render Chat History
+for message in st.session_state.messages:
+    avatar = "👤" if message["role"] == "user" else "🤖"
+    with st.chat_message(message["role"], avatar=avatar):
+        st.markdown(message["content"])
+
+        if message.get("mermaid_code"):
+            st.caption("📊 Diagram Arsitektur")
+            st_mermaid(message["mermaid_code"])
+
+        if message.get("sources"):
+            render_sources(message["sources"])
+
+# User Input
+chat_placeholder = (
+    "Tanyakan sesuatu tentang codebase ini..."
+    if has_index else
+    "Hubungkan repositori dulu di panel kiri untuk mulai bertanya"
+)
+
+if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar="👤"):
         st.markdown(prompt)
 
-    # 2. Proses jawaban AI dengan streaming
-    with st.chat_message("assistant"):
-        synthesizer = load_synthesizer()
-        
-        # Ambil referensi dokumen kode terlebih dahulu
-        relevant_docs = synthesizer.retriever.get_relevant_code(prompt, top_k=3)
+    with st.chat_message("assistant", avatar="🤖"):
+        try:
+            synthesizer = load_synthesizer()
+        except Exception as e:
+            st.error(f"Gagal memuat mesin AI: {e}")
+            st.stop()
+
+        target_folders_list = None
+        if chat_target_folders and chat_target_folders.strip():
+            target_folders_list = [
+                folder.strip()
+                for folder in chat_target_folders.split(",")
+                if folder.strip()
+            ]
+
+        with st.spinner("🔎 Menelusuri kode yang relevan..."):
+            try:
+                relevant_docs = synthesizer.retriever.get_relevant_code(
+                    prompt,
+                    top_k=3,
+                    target_folders=target_folders_list
+                )
+            except Exception as e:
+                st.error(f"Gagal mengambil konteks kode: {e}")
+                st.stop()
+
         sources = [
             {
                 "file_path": doc.metadata.get("file_path"),
@@ -158,22 +376,26 @@ if prompt := st.chat_input("Contoh: Bagaimana alur autentikasi user dan buatkan 
             for doc in relevant_docs
         ]
 
-        # Stream teks jawaban seperti efek mengetik
-        answer_text = st.write_stream(synthesizer.stream_answer(prompt))
-        
-        # Ekstrak & render diagram Mermaid jika ada
+        if target_folders_list and not relevant_docs:
+            st.warning(
+                f"Tidak ditemukan kode relevan di folder: {', '.join(target_folders_list)}. "
+                "Coba kosongkan filter folder atau periksa kembali nama foldernya."
+            )
+
+        answer_text = st.write_stream(
+            synthesizer.stream_answer(prompt, target_folders=target_folders_list)
+        )
+
         mermaid_code = extract_mermaid_code(answer_text)
         if mermaid_code:
-            st.caption("📊 Architecture Diagram:")
+            st.caption("📊 Diagram Arsitektur")
             st_mermaid(mermaid_code)
-        
-        # Render referensi file sumber jika ada
+
         if sources:
-            with st.expander("📍 Lihat Sumber Kode Referensi"):
-                for src in sources:
-                    st.markdown(f"- **`{src['file_path']}`** *(Baris {src['start_line']}-{src['end_line']})* — `{src['name']}`")
-        
-        # Simpan jawaban ke session state
+            if target_folders_list:
+                st.caption(f"🔍 Pencarian difokuskan pada folder: {', '.join(target_folders_list)}")
+            render_sources(sources)
+
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer_text,

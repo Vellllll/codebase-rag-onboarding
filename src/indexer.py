@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from git import Repo, GitCommandError
 import tempfile
@@ -14,78 +14,119 @@ from src.ast_parser import ASTCodeParser, CodeChunk
 load_dotenv()
 
 EXCLUDE_DIRS = {
-    "node_modules", ".git", "venv", "env", "__pycache__", 
+    "node_modules", ".git", "venv", "env", "__pycache__",
     "dist", "build", ".next", ".idea", ".vscode"
 }
 SUPPORTED_EXTENSIONS = {".ts", ".js", ".tsx", ".jsx", ".py"}
+
 
 class IncrementalCodebaseIndexer:
     def __init__(self, collection_name: str = "codebase_rag"):
         self.collection_name = collection_name
         self.embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-        self.parser = ASTCodeParser("typescript")
+        # Parser sekarang memilih grammar tree-sitter secara otomatis per file
+        # (lihat ast_parser.py) alih-alih hardcode ke satu bahasa.
+        self.parser = ASTCodeParser()
 
-    def _get_git_metadata(self, repo: Repo, file_path: str, line_number: int) -> Dict[str, Any]:
-        """Mengambil informasi Git Blame (Author, Date, Commit Message) untuk baris kode spesifik."""
+    # -----------------------------------------------------------------
+    # Git Blame: SATU panggilan `git blame` per FILE (bukan per chunk).
+    # Hasilnya dipetakan baris -> metadata commit, lalu dipakai ulang
+    # untuk semua chunk di file yang sama. Ini menghindari puluhan
+    # subprocess `git blame` terpisah untuk file dengan banyak fungsi.
+    # -----------------------------------------------------------------
+    def _build_file_blame_map(self, repo: Repo, file_path: str) -> Dict[int, Dict[str, Any]]:
+        blame_map: Dict[int, Dict[str, Any]] = {}
         try:
-            # Ambil relasi path terhadap root repositori
             rel_path = os.path.relpath(file_path, repo.working_dir)
-            
-            # Jalankan git blame pada baris tertentu
-            blame_data = repo.blame('HEAD', rel_path, L=f"{line_number},{line_number}")
-            if blame_data:
-                commit, lines = blame_data[0]
-                return {
+            blame_data = repo.blame('HEAD', rel_path)
+            if not blame_data:
+                return blame_map
+
+            line_no = 1
+            for commit, lines in blame_data:
+                meta = {
                     "author": commit.author.name,
                     "author_email": commit.author.email,
                     "commit_hash": commit.hexsha[:7],
                     "commit_date": commit.committed_datetime.strftime("%Y-%m-%d %H:%M"),
-                    "commit_message": commit.message.strip().split("\n")[0]
+                    "commit_message": commit.message.strip().split("\n")[0],
                 }
+                for _ in lines:
+                    blame_map[line_no] = meta
+                    line_no += 1
         except Exception:
             pass
-            
+
+        return blame_map
+
+    @staticmethod
+    def _lookup_blame(blame_map: Dict[int, Dict[str, Any]], line_number: int) -> Dict[str, Any]:
+        meta = blame_map.get(line_number)
+        if meta:
+            return meta
         return {
             "author": "Unknown",
             "commit_hash": "HEAD",
             "commit_date": "N/A",
-            "commit_message": "No commit history"
+            "commit_message": "No commit history",
         }
 
-    def walk_and_parse(self, repo_path: str, changed_files_only: List[str] = None) -> List[Document]:
-        """Memindai file di repositori dan menyisipkan metadata Git."""
+    def walk_and_parse(
+        self,
+        repo_path: str,
+        changed_files_only: List[str] = None,
+        target_folders: List[str] = None
+    ) -> List[Document]:
+        """Memindai file di repositori dan menyisipkan metadata Git, mendukung filter target folder."""
         documents = []
-        
-        # Inisialisasi Git Repo jika folder tersebut adalah git repository
+
         git_repo = None
         try:
             git_repo = Repo(repo_path, search_parent_directories=True)
         except Exception:
-            print("⚠️ Folder bukan repositori Git. Metadata Git Blame akan dilewati.")
+            print("  Folder bukan repositori Git. Metadata Git Blame akan dilewati.")
 
-        print(f"📂 Memulai pemindaian kode di: {repo_path}")
-        
+        print(f"  Memulai pemindaian kode di: {repo_path}")
+        if target_folders:
+            print(f"  Fokus indeksasi hanya pada folder: {target_folders}")
+
         for root, dirs, files in os.walk(repo_path):
             dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-
             for file in files:
                 ext = os.path.splitext(file)[1]
                 if ext in SUPPORTED_EXTENSIONS:
                     file_path = os.path.join(root, file)
-                    
-                    # Jika mode incremental aktif, lewati file yang tidak mengalami perubahan
+
+                    # --- FILTER FOLDER ---
+                    if target_folders:
+                        rel_file_path = os.path.relpath(file_path, repo_path)
+                        is_targeted = False
+
+                        for target in target_folders:
+                            target = os.path.normpath(target)
+                            if rel_file_path == target or rel_file_path.startswith(target + os.sep):
+                                is_targeted = True
+                                break
+
+                        if not is_targeted:
+                            continue
+                    # -------------------------------------
+
                     if changed_files_only and file_path not in changed_files_only:
                         continue
 
                     try:
                         chunks: List[CodeChunk] = self.parser.parse_file(file_path)
-                        
-                        for chunk in chunks:
-                            # Ekstrak Git Metadata jika git repo tersedia
-                            git_meta = {}
-                            if git_repo:
-                                git_meta = self._get_git_metadata(git_repo, file_path, chunk.start_line)
+                        if not chunks:
+                            continue
 
+                        # Satu blame per file, dipakai ulang untuk semua chunk-nya.
+                        blame_map: Dict[int, Dict[str, Any]] = {}
+                        if git_repo:
+                            blame_map = self._build_file_blame_map(git_repo, file_path)
+
+                        for chunk in chunks:
+                            git_meta = self._lookup_blame(blame_map, chunk.start_line)
                             doc = Document(
                                 page_content=chunk.content,
                                 metadata={
@@ -95,7 +136,6 @@ class IncrementalCodebaseIndexer:
                                     "name": chunk.name,
                                     "start_line": chunk.start_line,
                                     "end_line": chunk.end_line,
-                                    # Git Metadata
                                     "author": git_meta.get("author", "Unknown"),
                                     "commit_hash": git_meta.get("commit_hash", "HEAD"),
                                     "commit_date": git_meta.get("commit_date", "N/A"),
@@ -104,50 +144,32 @@ class IncrementalCodebaseIndexer:
                             )
                             documents.append(doc)
                     except Exception as e:
-                        print(f"❌ Error parsing {file_path}: {e}")
+                        print(f"  Error parsing {file_path}: {e}")
 
-        print(f"✅ Total {len(documents)} chunk berhasil diproses!")
+        print(f"  Total {len(documents)} chunk berhasil diproses!")
         return documents
 
-    def index_to_qdrant(self, documents: List[Document], vector_store_path: str = "./qdrant_storage", force_recreate: bool = True):
-        print(f"⚡ Meng-index {len(documents)} dokumen ke Qdrant (force_recreate={force_recreate})...")
-        
-        qdrant = QdrantVectorStore.from_documents(
-            documents=documents,
-            embedding=self.embeddings,
-            path=vector_store_path,
-            collection_name=self.collection_name,
-            force_recreate=force_recreate  # True untuk full re-index, False untuk incremental update
-        )
-        print("✅ Indeksasi Qdrant Selesai!")
-        return qdrant
-    
-    def index_from_github_url(self, github_url: str, github_token: str = None) -> int:
-        """
-        Meng-clone repo (public maupun private) ke temporary directory, 
-        mem-parse AST, lalu menghapus temp folder.
-        """
+    def index_from_github_url(self, github_url: str, github_token: str = None, target_folders_str: str = "") -> int:
+        """Meng-clone repo, mem-parse AST berdasarkan filter folder, lalu menghapus temp folder."""
         temp_dir = tempfile.mkdtemp()
         print(f"📥 Cloned repo temporarily to: {temp_dir}")
-        
-        # 1. Format URL untuk mensupport Private Repository menggunakan PAT
+
         clone_url = github_url.strip()
         if github_token and github_token.strip():
             token = github_token.strip()
-            # Mengubah 'https://github.com/username/private-repo'
-            # Menjadi 'https://<TOKEN>@github.com/username/private-repo'
             if clone_url.startswith("https://"):
                 clone_url = clone_url.replace("https://", f"https://{token}@")
 
         try:
-            # 2. Clone repository (shallow clone depth=1 agar sangat cepat)
             Repo.clone_from(clone_url, temp_dir, depth=1)
-            
-            # 3. Parse AST & Extract Chunks
-            docs = self.walk_and_parse(temp_dir)
-            
+
+            target_folders = None
+            if target_folders_str and target_folders_str.strip():
+                target_folders = [folder.strip() for folder in target_folders_str.split(",") if folder.strip()]
+
+            docs = self.walk_and_parse(temp_dir, target_folders=target_folders)
+
             if docs:
-                # 4. Index ke Qdrant Vector Store
                 self.index_to_qdrant(docs, force_recreate=True)
                 print(f"✅ Berhasil meng-index repositori dari URL: {github_url}")
                 return len(docs)
@@ -156,9 +178,51 @@ class IncrementalCodebaseIndexer:
                 return 0
 
         except GitCommandError as e:
-            print(f"❌ Error Git Cloning (Cek URL/PAT atau izin repositori): {e}")
-            raise Exception("Gagal meng-clone repositori. Pastikan URL dan GitHub Access Token valid serta memiliki izin akses ke repo ini.")
+            print(f"❌ Error Git Cloning: {e}")
+            raise Exception("Gagal meng-clone repositori.")
         finally:
-            # 5. Hapus folder temporary agar tidak memakan penyimpanan lokal
             shutil.rmtree(temp_dir)
             print("🧹 Temporary folder berhasil dibersihkan.")
+
+    def _get_qdrant_connection_kwargs(self, vector_store_path: str) -> Dict[str, Any]:
+        """
+        Qdrant lokal berbasis `path=` hanya aman diakses oleh SATU proses pada satu
+        waktu. Di proyek ini, Streamlit app dan webhook server (server.py) bisa
+        mengakses koleksi yang sama secara bersamaan -> resiko file lock/corruption.
+
+        Kalau QDRANT_URL diset di .env, kita pakai Qdrant dalam mode server (docker/
+        Qdrant Cloud) yang memang didesain untuk multi-proses/multi-writer. Kalau
+        tidak diset, tetap fallback ke mode lokal seperti sebelumnya, tapi user diberi
+        peringatan eksplisit di log supaya tahu ini bukan setup yang direkomendasikan
+        untuk dipakai bersamaan dengan webhook server.
+        """
+        qdrant_url = os.getenv("QDRANT_URL")
+        if qdrant_url:
+            kwargs: Dict[str, Any] = {"url": qdrant_url}
+            qdrant_api_key = os.getenv("QDRANT_API_KEY")
+            if qdrant_api_key:
+                kwargs["api_key"] = qdrant_api_key
+            return kwargs
+
+        print(
+            "  ⚠️ QDRANT_URL tidak diset — menggunakan Qdrant mode lokal (path=). "
+            "Mode ini TIDAK aman diakses bersamaan oleh Streamlit app dan webhook "
+            "server sekaligus. Untuk produksi/pemakaian bersamaan, jalankan Qdrant "
+            "sebagai server (docker run qdrant/qdrant) dan set QDRANT_URL di .env."
+        )
+        return {"path": vector_store_path}
+
+    def index_to_qdrant(self, documents: List[Document], vector_store_path: str = "./qdrant_storage", force_recreate: bool = True):
+        print(f"⚡ Meng-index {len(documents)} dokumen ke Qdrant (force_recreate={force_recreate})...")
+
+        connection_kwargs = self._get_qdrant_connection_kwargs(vector_store_path)
+
+        qdrant = QdrantVectorStore.from_documents(
+            documents=documents,
+            embedding=self.embeddings,
+            collection_name=self.collection_name,
+            force_recreate=force_recreate,
+            **connection_kwargs
+        )
+        print("✅ Indeksasi Qdrant Selesai!")
+        return qdrant

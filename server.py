@@ -15,8 +15,19 @@ app = FastAPI(
     description="Automated incremental re-indexing server triggered by GitHub Webhooks."
 )
 
-# Ambil Secret Key untuk verifikasi keamanan signature dari GitHub
-WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "my_super_secret_token")
+# Ambil Secret Key untuk verifikasi keamanan signature dari GitHub.
+# TIDAK ADA fallback default di sini dengan sengaja: default seperti
+# "my_super_secret_token" yang sama untuk semua deployment berarti siapa pun
+# yang tahu/menebak nilainya bisa memalsukan signature webhook kalau env var
+# lupa di-set. Server lebih baik gagal start daripada berjalan dengan secret
+# yang bisa ditebak.
+WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+if not WEBHOOK_SECRET:
+    raise RuntimeError(
+        "GITHUB_WEBHOOK_SECRET belum diset di environment/.env. "
+        "Server tidak akan dijalankan dengan secret default demi keamanan."
+    )
+
 LOCAL_REPO_PATH = os.getenv("LOCAL_REPO_PATH", "./sample_project")
 
 
