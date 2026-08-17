@@ -4,7 +4,7 @@ import os
 import re
 import json
 import yaml
-from datetime import datetime
+from datetime import datetime, date
 from yaml.loader import SafeLoader
 from streamlit_mermaid import st_mermaid
 from dotenv import load_dotenv
@@ -95,13 +95,12 @@ USER_QUOTA_PATH = "./qdrant_storage/user_quotas.json"
 
 def get_user_usage(username: str) -> int:
     """Mengambil jumlah prompt user hari ini."""
-    hari_ini = str(datetime.now().date())
+    hari_ini_str = str(date.today())  # <--- UBAH DI SINI
     if os.path.exists(USER_QUOTA_PATH):
         try:
             with open(USER_QUOTA_PATH, "r") as f:
                 data = json.load(f)
-            # Jika user ada dan tanggalnya adalah hari ini, kembalikan jumlahnya
-            if username in data and data[username]["date"] == hari_ini:
+            if username in data and data[username]["date"] == hari_ini_str:
                 return data[username]["count"]
         except Exception:
             return 0
@@ -109,7 +108,7 @@ def get_user_usage(username: str) -> int:
 
 def increment_user_usage(username: str):
     """Menambah hitungan prompt user sebesar 1."""
-    hari_ini = str(datetime.now().date())
+    hari_ini_str = str(date.today())  # <--- UBAH DI SINI
     data = {}
     if os.path.exists(USER_QUOTA_PATH):
         try:
@@ -118,11 +117,9 @@ def increment_user_usage(username: str):
         except Exception:
             pass
 
-    # Jika user belum ada atau hari sudah berganti, reset ke 1
-    if username not in data or data[username]["date"] != hari_ini:
-        data[username] = {"date": hari_ini, "count": 1}
+    if username not in data or data[username]["date"] != hari_ini_str:
+        data[username] = {"date": hari_ini_str, "count": 1}
     else:
-        # Jika hari yang sama, tambah 1
         data[username]["count"] += 1
 
     os.makedirs(os.path.dirname(USER_QUOTA_PATH), exist_ok=True)
@@ -192,7 +189,7 @@ import streamlit as st
 # ==========================================
 # LOGIKA RESET SESI HARIAN (MIDNIGHT RESET)
 # ==========================================
-hari_ini = datetime.date.today()
+hari_ini = date.today()
 
 # 1. Jika pengguna baru pertama kali membuka aplikasi hari ini, simpan tanggalnya
 if "session_date" not in st.session_state:
