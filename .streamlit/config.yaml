@@ -10,5 +10,5 @@ credentials:
       password: $2b$12$V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.v.V.
 cookie:
   expiry_days: 30
-  key: kunci_rahasia_cookie_acak
+  key: b9f87171b40fd608b25976e0377155732a3fc1f6ba9f3d4fa9a288021d414317
   name: codebase_rag_cookie
