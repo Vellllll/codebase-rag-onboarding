@@ -47,14 +47,14 @@ class CodebaseSynthesizer:
         # Direktori basis repositori yang sudah di-clone (Langkah 1)
         self.base_repo_path = os.path.abspath("./cloned_repo")
         
+        # 1. Definisi Tool Web Search
         try:
             self.web_search = DuckDuckGoSearchRun(name="web_search")
-            self.tools = [search_codebase, list_directory, read_file_content, self.web_search]
         except Exception as e:
             print(f"⚠️ Warning: Gagal memuat web_search tool: {e}")
-            # Fallback jika DuckDuckGo gagal di-load di server cloud
-            self.tools = [search_codebase, list_directory, read_file_content]
-        
+            self.web_search = None
+
+        # 2. DEFINISIKAN TOOLS DULU SEBELUM DIMASUKKAN KE LIST
         @tool
         def search_codebase(query: str) -> str:
             """Mencari potongan struktur kode spesifik dari repositori."""
@@ -71,31 +71,20 @@ class CodebaseSynthesizer:
                 return "Tidak ada kode relevan di Vector DB."
             return self._format_context(docs)
 
-        # ========================================================
-        # TOOL BARU 1: FILE EXPLORER (LIST DIRECTORY)
-        # ========================================================
         @tool
         def list_directory(dir_path: str = "") -> str:
-            """Melihat daftar file dan folder. Kosongkan argumen ('') untuk melihat root proyek."""
+            """Melihat daftar file dan folder."""
             try:
-                # Cegah agent keluar dari root repo (Directory Traversal Protection)
                 target_path = os.path.abspath(os.path.join(self.base_repo_path, dir_path))
                 if not target_path.startswith(self.base_repo_path):
-                    return "Error: Akses ditolak. Direktori di luar batasan repositori."
-                
+                    return "Error: Akses ditolak."
                 if not os.path.exists(target_path):
                     return f"Error: Direktori '{dir_path}' tidak ditemukan."
-                if not os.path.isdir(target_path):
-                    return f"Error: '{dir_path}' bukan sebuah direktori."
-                    
                 items = os.listdir(target_path)
                 return f"Isi direktori '{dir_path}':\n" + "\n".join(items)
             except Exception as e:
                 return f"Gagal membaca direktori: {e}"
 
-        # ========================================================
-        # TOOL BARU 2: FILE EXPLORER (READ FILE)
-        # ========================================================
         @tool
         def read_file_content(file_path: str) -> str:
             """Membaca isi keseluruhan sebuah file."""
@@ -103,31 +92,28 @@ class CodebaseSynthesizer:
                 target_path = os.path.abspath(os.path.join(self.base_repo_path, file_path))
                 if not target_path.startswith(self.base_repo_path):
                     return "Error: Akses ditolak."
-                    
                 if not os.path.exists(target_path):
                     return f"Error: File '{file_path}' tidak ditemukan."
-                if not os.path.isfile(target_path):
-                    return f"Error: '{file_path}' bukan file teks yang bisa dibaca."
-                    
                 with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                    
-                # Batasi panjang konten (kira-kira max 15.000 karakter) agar context LLM tidak meledak
                 if len(content) > 15000:
-                    return content[:15000] + "\n\n... [SISA KODE DIPOTONG KARENA TERLALU PANJANG]"
+                    return content[:15000] + "\n\n... [SISA KODE DIPOTONG]"
                 return content
             except Exception as e:
                 return f"Gagal membaca file: {e}"
 
-        # Daftarkan semua tools
-        self.tools = [search_codebase, list_directory, read_file_content, self.web_search]
-        
-        self.memory = MemorySaver()  
+        # 3. SETELAH SEMUA DIDEFINISIKAN, BARU MASUKKAN KE LIST self.tools
+        self.tools = [search_codebase, list_directory, read_file_content]
+        if self.web_search:
+            self.tools.append(self.web_search)
+
+        # 4. Inisialisasi LangGraph Agent
+        self.memory = MemorySaver()
         self.agent_executor = create_react_agent(
-            model=self.llm, 
-            tools=self.tools, 
+            model=self.llm,
+            tools=self.tools,
             prompt=SYSTEM_PROMPT,
-            checkpointer=self.memory  
+            checkpointer=self.memory
         )
 
     # (Biarkan metode _format_context, answer_question, dan stream_answer_events seperti sebelumnya)
