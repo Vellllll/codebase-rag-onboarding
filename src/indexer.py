@@ -150,39 +150,47 @@ class IncrementalCodebaseIndexer:
         return documents
 
     def index_from_github_url(self, github_url: str, github_token: str = None, target_folders_str: str = "") -> int:
-        """Meng-clone repo, mem-parse AST berdasarkan filter folder, lalu menghapus temp folder."""
-        temp_dir = tempfile.mkdtemp()
-        print(f"📥 Cloned repo temporarily to: {temp_dir}")
-
+        """Meng-clone repo ke folder permanen (cloned_repo), mem-parse AST, lalu membiarkannya agar bisa diakses oleh File Explorer Agent."""
+        
+        # 1. Tentukan folder permanen
+        repo_dir = os.path.abspath("./cloned_repo")
+        
+        # Bersihkan folder jika sudah ada repo sebelumnya
+        if os.path.exists(repo_dir):
+            import shutil
+            shutil.rmtree(repo_dir, ignore_errors=True)
+            
+        os.makedirs(repo_dir, exist_ok=True)
+        print(f"  Cloning repo ke direktori permanen: {repo_dir}")
+        
         clone_url = github_url.strip()
         if github_token and github_token.strip():
             token = github_token.strip()
             if clone_url.startswith("https://"):
                 clone_url = clone_url.replace("https://", f"https://{token}@")
-
+                
         try:
-            Repo.clone_from(clone_url, temp_dir, depth=1)
-
+            Repo.clone_from(clone_url, repo_dir, depth=1)
             target_folders = None
             if target_folders_str and target_folders_str.strip():
                 target_folders = [folder.strip() for folder in target_folders_str.split(",") if folder.strip()]
-
-            docs = self.walk_and_parse(temp_dir, target_folders=target_folders)
-
+                
+            # Parse dan Index ke Qdrant
+            docs = self.walk_and_parse(repo_dir, target_folders=target_folders)
+            
             if docs:
                 self.index_to_qdrant(docs, force_recreate=True)
-                print(f"✅ Berhasil meng-index repositori dari URL: {github_url}")
+                print(f"  Berhasil meng-index repositori dari URL: {github_url}")
                 return len(docs)
             else:
-                print("⚠️ Tidak ada file kode yang valid untuk di-index.")
+                print("  Tidak ada file kode yang valid untuk di-index.")
                 return 0
-
+                
         except GitCommandError as e:
-            print(f"❌ Error Git Cloning: {e}")
+            print(f"  Error Git Cloning: {e}")
             raise Exception("Gagal meng-clone repositori.")
-        finally:
-            shutil.rmtree(temp_dir)
-            print("🧹 Temporary folder berhasil dibersihkan.")
+            
+        # BLOK FINALLY (shutil.rmtree) DIHAPUS agar folder tidak lenyap!
 
     def _get_qdrant_connection_kwargs(self, vector_store_path: str) -> Dict[str, Any]:
         """

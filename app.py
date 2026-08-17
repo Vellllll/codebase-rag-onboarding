@@ -379,10 +379,12 @@ if prompt := st.chat_input(chat_placeholder, disabled=not has_index):
             for event in stream_generator:
                 if event["type"] == "tool_start":
                     tool_name = event["tool"]
-                    # Gunakan status.update(label=...) BUKAN status.write(...)
-                    # Ini akan menimpa teks utama di luar kotak, tanpa membuat daftar panjang ke bawah
                     if tool_name == "search_codebase":
-                        status.update(label="🔍 Sedang menelusuri kode di repositori lokal...")
+                        status.update(label="🔍 Sedang mencari relevansi kode (Vector Search)...")
+                    elif tool_name == "list_directory":
+                        status.update(label="📁 Sedang menjelajahi struktur folder repositori...")
+                    elif tool_name == "read_file_content":
+                        status.update(label="📄 Sedang membaca isi file secara utuh...")
                     elif tool_name == "web_search":
                         status.update(label="🌐 Sedang mencari referensi/dokumentasi dari internet...")
                         

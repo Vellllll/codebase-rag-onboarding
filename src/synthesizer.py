@@ -7,32 +7,32 @@ from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.memory import MemorySaver  # <-- IMPORT BARU
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.retriever import HybridCodeRetriever
 
 load_dotenv()
 
+# Perbarui System Prompt agar Agent sadar punya tool baru
 SYSTEM_PROMPT = """Anda adalah Senior Software Architect & Codebase Onboarding Mentor. 
-Tugas Anda adalah membantu developer memahami arsitektur kode dan riwayat perubahan repositori, 
-serta mencari informasi dari internet jika diperlukan (misalnya untuk dokumentasi eksternal).
 
-ATURAN UTAMA:
-1. Gunakan tool `search_codebase` untuk mencari konteks dari repositori lokal.
-2. Gunakan tool `web_search` JIKA informasi tidak ada di codebase atau butuh referensi dokumentasi terbaru dari internet.
-3. JIKA USER BERTANYA TENTANG RIWAYAT/PEMBUAT KODE: Sebutkan Nama Author, Commit Hash, Tanggal, dan Pesan Commit dari metadata yang tersedia.
-4. REFERENSI LOKASI: Selalu sertakan file path dan nomor baris (contoh: `src/auth.ts` Baris 12-30) jika merujuk ke kode.
-5. DIAGRAM MERMAID.JS: Buat diagram ```mermaid ... ``` jika user meminta gambaran alur data/arsitektur.
+ATURAN PENGGUNAAN TOOLS:
+1. `search_codebase`: Gunakan pertama kali untuk mencari potongan kode spesifik (fungsi/class) dari Vector DB.
+2. `list_directory`: Gunakan untuk melihat struktur folder/isi direktori proyek lokal.
+3. `read_file_content`: Gunakan untuk membaca SATU FILE UTUH jika chunk dari `search_codebase` terpotong atau Anda butuh melihat bagian import/konfigurasi global.
+4. `web_search`: Gunakan HANYA jika informasi butuh referensi dokumentasi internet.
+
+ATURAN JAWABAN:
+- Selalu sertakan file path jika merujuk ke kode.
+- Jika pengguna bertanya tentang Git/Author, berikan Nama Author, Hash, dan Pesan Commit dari metadata.
+- Buat diagram ```mermaid ... ``` jika user meminta visualisasi arsitektur.
 """
 
 class CodebaseSynthesizer:
     def __init__(self, model_name: str = "deepseek-chat"):
         self.retriever = HybridCodeRetriever()
-        
-        # Variabel untuk melacak kode lokal yang ditemukan oleh Tool
         self.last_sources = []
         
-        # --- KONFIGURASI DEEPSEEK API ---
         deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
         if not deepseek_api_key:
             raise ValueError("DEEPSEEK_API_KEY tidak ditemukan di file .env!")
@@ -44,18 +44,15 @@ class CodebaseSynthesizer:
             temperature=0.2
         )
         
-        # 1. Definisi Tools untuk Agent
-        self.web_search = DuckDuckGoSearchRun(
-            name="web_search",
-            description="Gunakan ini untuk mencari informasi umum, dokumentasi library, atau error di internet."
-        )
+        # Direktori basis repositori yang sudah di-clone (Langkah 1)
+        self.base_repo_path = os.path.abspath("./cloned_repo")
+        
+        self.web_search = DuckDuckGoSearchRun(name="web_search")
         
         @tool
         def search_codebase(query: str) -> str:
-            """Gunakan tool ini HANYA untuk mencari struktur kode, fungsi, class, dan riwayat git di dalam repositori lokal."""
+            """Mencari potongan struktur kode spesifik dari repositori."""
             docs = self.retriever.get_relevant_code(query, top_k=3)
-            
-            # Simpan metadata dokumen agar UI bisa menampilkannya
             self.last_sources = [
                 {
                     "file_path": doc.metadata.get("file_path"),
@@ -64,22 +61,70 @@ class CodebaseSynthesizer:
                     "name": doc.metadata.get("name")
                 } for doc in docs
             ]
-            
             if not docs:
-                return "Tidak ada kode yang relevan ditemukan di repositori."
+                return "Tidak ada kode relevan di Vector DB."
             return self._format_context(docs)
 
-        self.tools = [search_codebase, self.web_search]
+        # ========================================================
+        # TOOL BARU 1: FILE EXPLORER (LIST DIRECTORY)
+        # ========================================================
+        @tool
+        def list_directory(dir_path: str = "") -> str:
+            """Melihat daftar file dan folder. Kosongkan argumen ('') untuk melihat root proyek."""
+            try:
+                # Cegah agent keluar dari root repo (Directory Traversal Protection)
+                target_path = os.path.abspath(os.path.join(self.base_repo_path, dir_path))
+                if not target_path.startswith(self.base_repo_path):
+                    return "Error: Akses ditolak. Direktori di luar batasan repositori."
+                
+                if not os.path.exists(target_path):
+                    return f"Error: Direktori '{dir_path}' tidak ditemukan."
+                if not os.path.isdir(target_path):
+                    return f"Error: '{dir_path}' bukan sebuah direktori."
+                    
+                items = os.listdir(target_path)
+                return f"Isi direktori '{dir_path}':\n" + "\n".join(items)
+            except Exception as e:
+                return f"Gagal membaca direktori: {e}"
+
+        # ========================================================
+        # TOOL BARU 2: FILE EXPLORER (READ FILE)
+        # ========================================================
+        @tool
+        def read_file_content(file_path: str) -> str:
+            """Membaca isi keseluruhan sebuah file."""
+            try:
+                target_path = os.path.abspath(os.path.join(self.base_repo_path, file_path))
+                if not target_path.startswith(self.base_repo_path):
+                    return "Error: Akses ditolak."
+                    
+                if not os.path.exists(target_path):
+                    return f"Error: File '{file_path}' tidak ditemukan."
+                if not os.path.isfile(target_path):
+                    return f"Error: '{file_path}' bukan file teks yang bisa dibaca."
+                    
+                with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    
+                # Batasi panjang konten (kira-kira max 15.000 karakter) agar context LLM tidak meledak
+                if len(content) > 15000:
+                    return content[:15000] + "\n\n... [SISA KODE DIPOTONG KARENA TERLALU PANJANG]"
+                return content
+            except Exception as e:
+                return f"Gagal membaca file: {e}"
+
+        # Daftarkan semua tools
+        self.tools = [search_codebase, list_directory, read_file_content, self.web_search]
         
-        # 2. Inisialisasi Memory dan Agent LangGraph
-        self.memory = MemorySaver()  # <-- INISIALISASI MEMORY
-        
+        self.memory = MemorySaver()  
         self.agent_executor = create_react_agent(
             model=self.llm, 
             tools=self.tools, 
             prompt=SYSTEM_PROMPT,
-            checkpointer=self.memory  # <-- PASANG MEMORY KE AGENT
+            checkpointer=self.memory  
         )
+
+    # (Biarkan metode _format_context, answer_question, dan stream_answer_events seperti sebelumnya)
 
     def _format_context(self, docs: List[Document]) -> str:
         formatted_blocks = []
