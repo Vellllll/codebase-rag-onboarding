@@ -1,4 +1,8 @@
 import os
+import re
+import select
+import subprocess
+import threading
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from git import Repo, GitCommandError
@@ -12,6 +16,17 @@ from langchain_core.documents import Document
 from src.ast_parser import ASTCodeParser, CodeChunk
 
 load_dotenv()
+
+
+class IndexingCancelled(Exception):
+    """Dilempar ketika user menekan tombol stop di tengah proses indexing."""
+    pass
+
+
+def _check_cancelled(cancel_event: Optional[threading.Event]):
+    if cancel_event is not None and cancel_event.is_set():
+        raise IndexingCancelled("Indexing dibatalkan oleh pengguna.")
+
 
 EXCLUDE_DIRS = {
     "node_modules", ".git", "venv", "env", "__pycache__",
@@ -75,7 +90,8 @@ class IncrementalCodebaseIndexer:
         self,
         repo_path: str,
         changed_files_only: List[str] = None,
-        target_folders: List[str] = None
+        target_folders: List[str] = None,
+        cancel_event: Optional[threading.Event] = None
     ) -> List[Document]:
         """Memindai file di repositori dan menyisipkan metadata Git, mendukung filter target folder."""
         documents = []
@@ -91,10 +107,12 @@ class IncrementalCodebaseIndexer:
             print(f"  Fokus indeksasi hanya pada folder: {target_folders}")
 
         for root, dirs, files in os.walk(repo_path):
+            _check_cancelled(cancel_event)
             dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
             for file in files:
                 ext = os.path.splitext(file)[1]
                 if ext in SUPPORTED_EXTENSIONS:
+                    _check_cancelled(cancel_event)
                     file_path = os.path.join(root, file)
 
                     # --- FILTER FOLDER ---
@@ -152,48 +170,117 @@ class IncrementalCodebaseIndexer:
         print(f"  Total {len(documents)} chunk berhasil diproses!")
         return documents
 
-    def index_from_github_url(self, github_url: str, github_token: str = None, target_folders_str: str = "") -> int:
+    @staticmethod
+    def _parse_clone_percent(line: str) -> Optional[float]:
+        match = re.search(r"(\d{1,3})%", line)
+        if not match:
+            return None
+        return min(max(int(match.group(1)) / 100.0, 0.0), 1.0)
+
+    def _clone_with_progress(
+        self,
+        clone_url: str,
+        repo_dir: str,
+        progress_callback=None,
+        cancel_event: Optional[threading.Event] = None
+    ):
+        """
+        Clone manual via subprocess (bukan GitPython Repo.clone_from) supaya kita
+        pegang handle proses `git` secara langsung -> bisa di-terminate() paksa
+        saat user menekan tombol stop, dan bisa di-poll tanpa block permanen
+        lewat select() dengan timeout.
+        """
+        cmd = ["git", "clone", "--progress", "--depth", "1", "--", clone_url, repo_dir]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, bufsize=1
+        )
+        last_fraction = 0.0
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    raise IndexingCancelled("Indexing dibatalkan oleh pengguna saat proses clone.")
+
+                ready, _, _ = select.select([proc.stderr], [], [], 0.5)
+                if ready:
+                    line = proc.stderr.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    fraction = self._parse_clone_percent(line)
+                    if fraction is not None:
+                        last_fraction = fraction
+                    if progress_callback:
+                        progress_callback(last_fraction, line)
+                elif proc.poll() is not None:
+                    break
+        finally:
+            returncode = proc.wait()
+
+        if returncode != 0:
+            stderr_tail = proc.stderr.read() if proc.stderr else ""
+            raise GitCommandError(["git", "clone"], returncode, stderr_tail)
+
+    def index_from_github_url(
+        self,
+        github_url: str,
+        github_token: str = None,
+        target_folders_str: str = "",
+        progress_callback=None,
+        cancel_event: Optional[threading.Event] = None
+    ) -> int:
         """Meng-clone repo ke folder permanen (cloned_repo), mem-parse AST, lalu membiarkannya agar bisa diakses oleh File Explorer Agent."""
-        
+
         # 1. Tentukan folder permanen
         repo_dir = os.path.abspath("./cloned_repo")
-        
+
         # Bersihkan folder jika sudah ada repo sebelumnya
         if os.path.exists(repo_dir):
             import shutil
             shutil.rmtree(repo_dir, ignore_errors=True)
-            
+
         os.makedirs(repo_dir, exist_ok=True)
         print(f"  Cloning repo ke direktori permanen: {repo_dir}")
-        
+
         clone_url = github_url.strip()
         if github_token and github_token.strip():
             token = github_token.strip()
             if clone_url.startswith("https://"):
                 clone_url = clone_url.replace("https://", f"https://{token}@")
-                
+
         try:
-            Repo.clone_from(clone_url, repo_dir, depth=1)
+            self._clone_with_progress(clone_url, repo_dir, progress_callback, cancel_event)
+
             target_folders = None
             if target_folders_str and target_folders_str.strip():
                 target_folders = [folder.strip() for folder in target_folders_str.split(",") if folder.strip()]
-                
+
             # Parse dan Index ke Qdrant
-            docs = self.walk_and_parse(repo_dir, target_folders=target_folders)
-            
+            docs = self.walk_and_parse(repo_dir, target_folders=target_folders, cancel_event=cancel_event)
+
             if docs:
-                self.index_to_qdrant(docs, force_recreate=True)
+                self.index_to_qdrant(docs, force_recreate=True, cancel_event=cancel_event)
                 print(f"  Berhasil meng-index repositori dari URL: {github_url}")
                 return len(docs)
             else:
                 print("  Tidak ada file kode yang valid untuk di-index.")
                 return 0
-                
+
         except GitCommandError as e:
             print(f"  Error Git Cloning: {e}")
-            raise Exception("Gagal meng-clone repositori.")
-            
-        # BLOK FINALLY (shutil.rmtree) DIHAPUS agar folder tidak lenyap!
+            raise Exception(f"Gagal meng-clone repositori: {e}")
+        except IndexingCancelled:
+            print("  Indexing dibatalkan oleh pengguna. Membersihkan folder clone...")
+            shutil.rmtree(repo_dir, ignore_errors=True)
+            raise
+
+        # BLOK FINALLY (shutil.rmtree) DIHAPUS agar folder tidak lenyap saat error biasa!
 
     def _get_qdrant_connection_kwargs(self, vector_store_path: str) -> Dict[str, Any]:
         """
@@ -209,7 +296,9 @@ class IncrementalCodebaseIndexer:
         """
         qdrant_url = os.getenv("QDRANT_URL")
         if qdrant_url:
-            kwargs: Dict[str, Any] = {"url": qdrant_url}
+            # Default httpx timeout terlalu pendek untuk batch upsert berisi chunk kode
+            # yang besar (repo besar -> banyak dokumen sekaligus per batch) -> WriteTimeout.
+            kwargs: Dict[str, Any] = {"url": qdrant_url, "timeout": int(os.getenv("QDRANT_TIMEOUT", "60"))}
             qdrant_api_key = os.getenv("QDRANT_API_KEY")
             if qdrant_api_key:
                 kwargs["api_key"] = qdrant_api_key
@@ -223,17 +312,34 @@ class IncrementalCodebaseIndexer:
         )
         return {"path": vector_store_path}
 
-    def index_to_qdrant(self, documents: List[Document], vector_store_path: str = "./qdrant_storage", force_recreate: bool = True):
+    def index_to_qdrant(
+        self,
+        documents: List[Document],
+        vector_store_path: str = "./qdrant_storage",
+        force_recreate: bool = True,
+        cancel_event: Optional[threading.Event] = None,
+        batch_size: int = 32
+    ):
         print(f"⚡ Meng-index {len(documents)} dokumen ke Qdrant (force_recreate={force_recreate})...")
 
         connection_kwargs = self._get_qdrant_connection_kwargs(vector_store_path)
 
+        # Upload batch pertama lewat from_documents (bikin/reset koleksi), sisanya
+        # di-upload manual per-batch supaya ada titik pengecekan cancel_event di
+        # tengah proses upload (repo besar -> ratusan batch, bisa makan waktu lama).
+        first_batch, rest = documents[:batch_size], documents[batch_size:]
         qdrant = QdrantVectorStore.from_documents(
-            documents=documents,
+            documents=first_batch,
             embedding=self.embeddings,
             collection_name=self.collection_name,
             force_recreate=force_recreate,
+            batch_size=batch_size,
             **connection_kwargs
         )
+
+        for i in range(0, len(rest), batch_size):
+            _check_cancelled(cancel_event)
+            qdrant.add_documents(rest[i:i + batch_size])
+
         print("✅ Indeksasi Qdrant Selesai!")
         return qdrant

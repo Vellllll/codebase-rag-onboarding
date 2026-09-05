@@ -9,13 +9,15 @@ from yaml.loader import SafeLoader
 from streamlit_mermaid import st_mermaid
 from dotenv import load_dotenv
 import streamlit_authenticator as stauth
+import threading
+import time
 
 # Load environment variables
 load_dotenv()
 
 try:
     from src.synthesizer import CodebaseSynthesizer
-    from src.indexer import IncrementalCodebaseIndexer
+    from src.indexer import IncrementalCodebaseIndexer, IndexingCancelled
 except Exception as e:
     import traceback
     st.error(f"❌ Gagal mengimpor modul internal: {e}")
@@ -281,6 +283,9 @@ with st.sidebar:
         disabled=st.session_state.indexing_in_progress
     )
 
+    if "index_job" not in st.session_state:
+        st.session_state.index_job = None
+
     if index_clicked:
         url_clean = github_url_input.strip()
         if not url_clean:
@@ -288,22 +293,70 @@ with st.sidebar:
         elif not is_valid_github_url(url_clean):
             st.error("Format URL GitHub tidak valid. Contoh: https://github.com/user/repo")
         else:
-            st.session_state.indexing_in_progress = True
-            try:
-                with st.status("📦 Memproses Repositori...", expanded=True) as status:
-                    st.write("⬇️ Mengunduh repository...")
+            cancel_event = threading.Event()
+            # `shared` HANYA berisi tipe data biasa (bukan widget Streamlit) karena
+            # diakses lintas thread. Progress bar & tombol tetap dirender dari main
+            # thread (lihat blok polling di bawah) supaya tidak butuh ScriptRunContext.
+            shared = {
+                "fraction": 0.0, "message": "Menyiapkan clone...",
+                "done": False, "total_chunks": 0, "error": None, "cancelled": False
+            }
+
+            def _on_progress(fraction, message, _shared=shared):
+                _shared["fraction"] = fraction
+                _shared["message"] = message
+
+            def _run_indexing_job(_shared=shared, _cancel_event=cancel_event, _url=url_clean,
+                                   _token=github_token_input, _folders=target_folders_input):
+                try:
                     indexer = IncrementalCodebaseIndexer()
-
-                    st.write("🌳 Membedah Abstract Syntax Tree (AST)...")
-                    total_chunks = indexer.index_from_github_url(
-                        github_url=url_clean,
-                        github_token=github_token_input if github_token_input else None,
-                        target_folders_str=target_folders_input
+                    total = indexer.index_from_github_url(
+                        github_url=_url,
+                        github_token=_token if _token else None,
+                        target_folders_str=_folders,
+                        progress_callback=_on_progress,
+                        cancel_event=_cancel_event
                     )
+                    _shared["total_chunks"] = total
+                except IndexingCancelled:
+                    _shared["cancelled"] = True
+                except Exception as e:
+                    _shared["error"] = str(e)
+                finally:
+                    _shared["done"] = True
 
+            thread = threading.Thread(target=_run_indexing_job, daemon=True)
+            thread.start()
+            st.session_state.index_job = {
+                "thread": thread, "cancel_event": cancel_event, "shared": shared, "url": url_clean
+            }
+            st.session_state.indexing_in_progress = True
+            st.rerun()
+
+    job = st.session_state.index_job
+    if st.session_state.indexing_in_progress and job:
+        shared = job["shared"]
+        with st.status("📦 Memproses Repositori...", expanded=True) as status:
+            st.write("⬇️ Mengunduh & meng-index repository...")
+            st.progress(shared["fraction"], text=shared["message"])
+
+            if not shared["done"]:
+                if st.button("⏹️ Hentikan Indexing", use_container_width=True, key="stop_indexing_btn"):
+                    job["cancel_event"].set()
+                    st.info("Menghentikan indexing... mohon tunggu sebentar.")
+
+            if shared["done"]:
+                if shared["cancelled"]:
+                    status.update(label="⏹️ Indexing dibatalkan.", state="error", expanded=False)
+                    st.toast("Indexing dibatalkan.", icon="⏹️")
+                elif shared["error"]:
+                    status.update(label="❌ Indexing gagal.", state="error", expanded=False)
+                    st.error(f"❌ Detail Error: {shared['error']}")
+                else:
+                    total_chunks = shared["total_chunks"]
                     if total_chunks > 0:
                         st.cache_resource.clear()
-                        save_index_metadata(url_clean, total_chunks)
+                        save_index_metadata(job["url"], total_chunks)
                         st.session_state.messages = []
                         status.update(
                             label=f"✅ Berhasil! {total_chunks} chunk kode tersimpan.",
@@ -315,12 +368,11 @@ with st.sidebar:
                             label="⚠️ Tidak ada file kode yang cocok untuk diproses.",
                             state="error"
                         )
-            except Exception as e:
-                st.error(f"❌ Detail Error: {e}")
-                import traceback
-                traceback.print_exc()
-            finally:
                 st.session_state.indexing_in_progress = False
+                st.session_state.index_job = None
+                st.rerun()
+            else:
+                time.sleep(0.5)
                 st.rerun()
 
     st.divider()
